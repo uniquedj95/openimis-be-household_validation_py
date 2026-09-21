@@ -18,18 +18,22 @@ def yes_no(value):
     return None
 
 
-def participant_status(primary_worker, business):
+def participant_status(primary_worker, business, *, business_columns_enabled=True):
+    if not business_columns_enabled:
+        return VERIFIED if primary_worker is True else NOT_VERIFIED
     business = yes_no(business)
     if primary_worker is True and business is not None:
         return VERIFIED
-    if primary_worker is not True and business is True:
-        return REJECTED
+    # Business information on a non-primary worker is an upload validation error.
     return NOT_VERIFIED
 
 
-def household_status(rows):
+def household_status(rows, *, business_columns_enabled=True):
     """Reject conflicting households before considering a qualifying worker."""
-    statuses = [participant_status(worker, business) for worker, business in rows]
+    statuses = [
+        participant_status(worker, business, business_columns_enabled=business_columns_enabled)
+        for worker, business in rows
+    ]
     if sum(worker is True for worker, _ in rows) > 1 or REJECTED in statuses:
         return REJECTED
     return VERIFIED if VERIFIED in statuses else NOT_VERIFIED

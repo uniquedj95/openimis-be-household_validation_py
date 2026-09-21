@@ -92,6 +92,9 @@ class WorkbookParseResult:
 
 
 def parse_validation_workbook(file_or_bytes):
+    from household_validation.apps import HouseholdValidationConfig
+
+    business_columns_enabled = HouseholdValidationConfig.business_columns_enabled
     workbook = load_workbook(_to_bytes_io(file_or_bytes), data_only=True)
     errors = []
     if VALIDATION_LIST_SHEET not in workbook.sheetnames:
@@ -133,6 +136,14 @@ def parse_validation_workbook(file_or_bytes):
         business_updates, business_errors = _parse_business_values(row_number, values)
         row_errors.extend(business_errors)
         primary_worker = _parse_yes_no(values.get("primary_worker"))
+        if business_columns_enabled and primary_worker is not True and any(
+            _clean(values.get(column)) is not None
+            for column in (HAS_BUSINESS_COLUMN, BUSINESS_TYPE_COLUMN, BUSINESS_DURATION_COLUMN)
+        ):
+            row_errors.append(
+                f"Row {row_number}: business information is only available for the selected "
+                "Primary Worker. Clear all three business fields or select Primary Worker YES."
+            )
         validation_date = _parse_date(values.get("validation_date"))
         project_label = _clean(values.get("project"))
         project_name = _resolve_project_name(project_label, project_options)

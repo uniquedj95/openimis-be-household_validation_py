@@ -35,6 +35,7 @@ from household_validation.apps import (
     HouseholdValidationConfig,
 )
 from household_validation.excel import (
+    BUSINESS_COLUMNS,
     BUSINESS_DURATION_COLUMN,
     BUSINESS_TYPE_COLUMN,
     BUSINESS_TYPE_OPTIONS_SHEET,
@@ -93,6 +94,17 @@ from household_validation.wealth import get_household_pmt_score, get_household_w
 
 
 class HouseholdValidationConfigTest(TestCase):
+    def test_business_columns_are_disabled_by_default_and_for_older_config(self):
+        self.assertIs(DEFAULT_CONFIG["business_columns_enabled"], False)
+        with patch.object(HouseholdValidationConfig, "business_columns_enabled", True):
+            HouseholdValidationConfig._load_config({})
+            self.assertIs(HouseholdValidationConfig.business_columns_enabled, False)
+
+    def test_business_columns_can_be_enabled_per_deployment(self):
+        with patch.object(HouseholdValidationConfig, "business_columns_enabled", False):
+            HouseholdValidationConfig._load_config({"business_columns_enabled": True})
+            self.assertIs(HouseholdValidationConfig.business_columns_enabled, True)
+
     def test_default_config_exposes_permission_lists(self):
         self.assertEqual(
             DEFAULT_CONFIG["gql_query_household_validation_rule_perms"],
@@ -1538,6 +1550,121 @@ class ValidationUploadParserTest(TestCase):
 
 
 class ExcelValidationListExporterTest(TestCase):
+    def setUp(self):
+        # Existing business collection tests exercise the Jobs-Now configuration.
+        patcher = patch.object(HouseholdValidationConfig, "business_columns_enabled", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch.object(HouseholdValidationConfig, "business_columns_enabled", False)
+    def test_disabled_business_columns_preserve_core_workbook_and_upload(self):
+        from household_validation.excel import (
+            PRIMARY_WORKER_ANSWERS_RANGE, PRIMARY_WORKER_NO_RANGE,
+        )
+
+        projects = [SimpleNamespace(id="project-1", name="Road Works")]
+        content = ExcelValidationListExporter(
+            self._selection_result(member_count=2), "batch-1", projects=projects,
+        ).export_bytes()
+        workbook = load_workbook(BytesIO(content))
+        worksheet = workbook[VALIDATION_LIST_SHEET]
+        headers = [cell.value for cell in worksheet[1]]
+        self.assertEqual(headers, [col for col in EXCEL_COLUMNS if col not in BUSINESS_COLUMNS])
+        self.assertNotIn(BUSINESS_TYPE_OPTIONS_SHEET, workbook.sheetnames)
+        self.assertEqual(worksheet.max_row, 3)
+        self.assertTrue(worksheet.protection.sheet)
+        self.assertFalse(self._cell(worksheet, "validation_notes").protection.locked)
+        self.assertEqual(self._value(worksheet, "member_uuid"), "member-1")
+        self.assertEqual(self._value(worksheet, "national_id"), "NAT-001")
+        self.assertEqual(self._cell(worksheet, "national_id").number_format, "@")
+        for column in ("batch_id", "group_uuid", "member_uuid", "row_type", "project_id"):
+            self.assertTrue(worksheet.column_dimensions[self._cell(worksheet, column).column_letter].hidden)
+        for column in ("participant_status", "household_status"):
+            cell = self._cell(worksheet, column)
+            self.assertEqual(cell.data_type, "f")
+            self.assertTrue(cell.protection.locked)
+            self.assertNotIn("#REF!", cell.value)
+        self.assertEqual(
+            self._value(worksheet, "participant_status"),
+            '=IF(OR(UPPER(TRIM(P2&""))="YES",UPPER(TRIM(P2&""))="Y",'
+            'UPPER(TRIM(P2&""))="TRUE",UPPER(TRIM(P2&""))="1"),"VERIFIED","NOT_VERIFIED")',
+        )
+        participant_col = self._cell(worksheet, "participant_status").column_letter
+        self.assertIn(f"${participant_col}$2:${participant_col}$3", self._value(worksheet, "household_status"))
+
+        # Only the primary-worker and project dropdowns remain; no business rules.
+        rules = worksheet.data_validations.dataValidation
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(worksheet.conditional_formatting), 1)
+        self.assertTrue(any("HouseholdPrimaryWorkerAnswers" in rule.formula1 for rule in rules))
+        self.assertTrue(any(rule.formula1 == "'Project Options'!$C$2:$C$2" for rule in rules))
+        self.assertEqual(set(workbook.defined_names), {PRIMARY_WORKER_ANSWERS_RANGE, PRIMARY_WORKER_NO_RANGE})
+        for name, reference in (
+            (PRIMARY_WORKER_ANSWERS_RANGE, "$E$2:$E$3"),
+            (PRIMARY_WORKER_NO_RANGE, "$E$3"),
+        ):
+            self.assertEqual(list(workbook.defined_names[name].destinations), [(PROJECT_OPTIONS_SHEET, reference)])
+        options = workbook[PROJECT_OPTIONS_SHEET]
+        self.assertEqual(options.sheet_state, "hidden")
+        self.assertEqual([options["E2"].value, options["E3"].value], ["YES", "NO"])
+
+        self._cell(worksheet, "primary_worker").value = "YES"
+        self._cell(worksheet, "validation_notes").value = "Confirmed"
+        output = BytesIO()
+        workbook.save(output)
+        parsed = parse_validation_workbook(output.getvalue())
+        self.assertEqual(parsed.errors, [])
+        self.assertTrue(parsed.rows[0].primary_worker)
+        self.assertEqual(parsed.rows[0].values["validation_notes"], "Confirmed")
+        for column in BUSINESS_COLUMNS:
+            self.assertIsNone(parsed.rows[0].values[column])
+
+    def test_export_configuration_is_read_for_each_workbook(self):
+        for enabled in (False, True, False):
+            with self.subTest(enabled=enabled), patch.object(
+                HouseholdValidationConfig, "business_columns_enabled", enabled,
+            ):
+                workbook = ExcelValidationListExporter(
+                    self._selection_result(), "batch-1",
+                ).export_workbook()
+                headers = [cell.value for cell in workbook[VALIDATION_LIST_SHEET][1]]
+                self.assertEqual(BUSINESS_COLUMNS.issubset(headers), enabled)
+                self.assertEqual(BUSINESS_TYPE_OPTIONS_SHEET in workbook.sheetnames, enabled)
+        self.assertTrue(BUSINESS_COLUMNS.issubset(EXCEL_COLUMNS))
+
+    @patch.object(HouseholdValidationConfig, "business_columns_enabled", False)
+    def test_empty_export_without_business_columns(self):
+        content = ExcelValidationListExporter(
+            SelectionResult(main=[], reserve=[]), "batch-1",
+        ).export_bytes()
+        workbook = load_workbook(BytesIO(content))
+        worksheet = workbook[VALIDATION_LIST_SHEET]
+        self.assertEqual(worksheet.max_row, 1)
+        self.assertEqual(worksheet.max_column, len(EXCEL_COLUMNS) - 3)
+        self.assertNotIn(BUSINESS_TYPE_OPTIONS_SHEET, workbook.sheetnames)
+        self.assertEqual(len(worksheet.data_validations.dataValidation), 1)
+
+    def test_upload_accepts_existing_business_workbooks_in_both_deployments(self):
+        workbook = ExcelValidationListExporter(self._selection_result(), "batch-1").export_workbook()
+        worksheet = workbook[VALIDATION_LIST_SHEET]
+        for column, value in {
+            "primary_worker": "YES",
+            HAS_BUSINESS_COLUMN: "Yes",
+            BUSINESS_TYPE_COLUMN: "Crop farming",
+            BUSINESS_DURATION_COLUMN: 2,
+        }.items():
+            self._cell(worksheet, column).value = value
+        output = BytesIO()
+        workbook.save(output)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.object(
+                HouseholdValidationConfig, "business_columns_enabled", enabled,
+            ):
+                parsed = parse_validation_workbook(output.getvalue())
+                self.assertEqual(parsed.errors, [])
+                self.assertEqual(parsed.rows[0].values[BUSINESS_TYPE_COLUMN], "Crop farming")
+                self.assertEqual(parsed.rows[0].values[BUSINESS_DURATION_COLUMN], 2)
+
     @patch("household_validation.services.IndividualService")
     def test_export_edit_upload_persists_member_fields(self, service_mock):
         workbook = ExcelValidationListExporter(
@@ -1758,10 +1885,9 @@ class ExcelValidationListExporterTest(TestCase):
             if f"{column}2" in item.sqref
         )
         self.assertEqual(str(validation.sqref), f"{column}2:{column}3")
-        self.assertEqual(validation.formula1,
-            f'INDIRECT(IF(OR(UPPER(TRIM(${worker}2))="YES",'
-            f'UPPER(TRIM(${worker}2))="NO"),'
-            f'"{BUSINESS_ANSWERS_RANGE}","{BUSINESS_UNAVAILABLE_RANGE}"))')
+        self.assertIn(f'TRIM(${worker}2&"")="YES"', validation.formula1)
+        self.assertNotIn('="NO"', validation.formula1)
+        self.assertLessEqual(len(validation.formula1), 255)
         self.assertTrue(validation.showInputMessage)
         self.assertEqual(validation.promptTitle, "Select Primary Worker first")
         self.assertTrue(validation.showErrorMessage)
@@ -2095,7 +2221,8 @@ class ExcelValidationListExporterTest(TestCase):
         )
 
     def _cell(self, worksheet, column_name, row_number=2):
-        return worksheet.cell(row_number, EXCEL_COLUMNS.index(column_name) + 1)
+        headers = [cell.value for cell in worksheet[1]]
+        return worksheet.cell(row_number, headers.index(column_name) + 1)
 
     def _value(self, worksheet, column_name, row_number=2):
         return self._cell(worksheet, column_name, row_number).value
@@ -3449,6 +3576,52 @@ class UploadHardeningTest(TestCase):
 
 
 class BusinessVerificationRulesTest(TestCase):
+    def setUp(self):
+        patcher = patch.object(HouseholdValidationConfig, "business_columns_enabled", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_non_primary_business_answers_block_the_whole_household(self):
+        fixture = ExcelValidationListExporterTest()
+        for worker in ("NO", None):
+            for column, value in ((HAS_BUSINESS_COLUMN, "Yes"), (HAS_BUSINESS_COLUMN, "No"),
+                                  (BUSINESS_TYPE_COLUMN, "Crop farming"), (BUSINESS_DURATION_COLUMN, 0)):
+                with self.subTest(worker=worker, column=column, value=value):
+                    workbook = ExcelValidationListExporter(fixture._selection_result(member_count=2), "batch-1").export_workbook()
+                    sheet = workbook[VALIDATION_LIST_SHEET]
+                    fixture._cell(sheet, "primary_worker", 2).value = "YES"
+                    fixture._cell(sheet, HAS_BUSINESS_COLUMN, 2).value = "No"
+                    fixture._cell(sheet, "primary_worker", 3).value = worker
+                    fixture._cell(sheet, column, 3).value = value
+                    content = ValidationUploadParserTest()._workbook_bytes(workbook)
+                    parsed = parse_validation_workbook(content)
+                    self.assertIn("group-1", parsed.invalid_group_keys)
+                    self.assertTrue(any("Clear all three business fields" in error for error in parsed.errors))
+                    service = HouseholdValidationUploadService()
+                    with patch.object(service, "_resolve_row", return_value=([], None, None, None)):
+                        result = service.upload(content, dry_run=True)
+                    self.assertGreater(result["errors"], 0)
+                    self.assertEqual(result["households_verified"], 0)
+                    self.assertEqual(result["participants_verified"], 0)
+
+    def test_all_business_fields_have_primary_worker_gates_and_stale_value_highlights(self):
+        fixture = ExcelValidationListExporterTest()
+        workbook = ExcelValidationListExporter(fixture._selection_result(), "batch-1").export_workbook()
+        sheet = workbook[VALIDATION_LIST_SHEET]
+        for column in BUSINESS_COLUMNS:
+            cell = fixture._cell(sheet, column)
+            rule = next(rule for rule in sheet.data_validations.dataValidation if cell.coordinate in rule.sqref)
+            self.assertIn('$P2', rule.formula1)
+            self.assertLessEqual(len(rule.formula1), 255 if rule.type == "list" else 8192)
+            self.assertEqual(rule.errorStyle, "stop")
+            self.assertTrue(rule.showErrorMessage)
+            self.assertFalse(rule.allow_blank)
+            rules = [r for target in sheet.conditional_formatting if cell.coordinate in target.sqref
+                     for r in sheet.conditional_formatting[target]]
+            self.assertTrue(any('NOT(' in r.formula[0] and 'LEN(TRIM(' in r.formula[0] for r in rules))
+            self.assertFalse(any(r.dxf.fill.fgColor.rgb == 'FFE7E6E6' for r in rules))
+            self.assertEqual(cell.fill.fgColor.rgb, fixture._cell(sheet, "validation_notes").fill.fgColor.rgb)
+
     def test_business_rejections_are_included_in_download(self):
         from household_validation.verification import BUSINESS_REJECTION_CODE
 
@@ -3472,9 +3645,7 @@ class BusinessVerificationRulesTest(TestCase):
             ("YES", "Yes", VERIFIED),
             ("YES", "No", VERIFIED),
             ("YES", None, NOT_VERIFIED),
-            ("NO", "Yes", REJECTED),
-            (None, "Yes", REJECTED),
-            ("NO", "No", NOT_VERIFIED),
+            ("NO", None, NOT_VERIFIED),
             (None, None, NOT_VERIFIED),
         )
         for worker, business, expected in scenarios:
@@ -3484,6 +3655,7 @@ class BusinessVerificationRulesTest(TestCase):
                 for column, value in (("primary_worker", worker), (HAS_BUSINESS_COLUMN, business)):
                     sheet.cell(2, EXCEL_COLUMNS.index(column) + 1, value)
                 if business == "Yes":
+                    sheet.cell(2, EXCEL_COLUMNS.index(BUSINESS_TYPE_COLUMN) + 1, "Crop farming")
                     sheet.cell(2, EXCEL_COLUMNS.index(BUSINESS_DURATION_COLUMN) + 1, 1)
                 # Never trust status text or cached formula values supplied by the client.
                 for column in ("participant_status", "household_status"):
@@ -3529,8 +3701,8 @@ class BusinessVerificationRulesTest(TestCase):
     def test_rejection_takes_priority_in_household_with_mixed_members(self):
         from household_validation.verification import household_status
 
-        self.assertEqual(household_status([(True, "Yes"), (False, "Yes")]), "REJECTED")
-        self.assertEqual(household_status([(True, "No"), (None, "Yes")]), "REJECTED")
+        self.assertEqual(household_status([(True, "Yes"), (False, None)]), "VERIFIED")
+        self.assertEqual(household_status([(True, "No"), (None, None)]), "VERIFIED")
         self.assertEqual(household_status([(True, "Yes"), (False, "No")]), "VERIFIED")
         self.assertEqual(household_status([(True, "Yes"), (True, "No")]), "REJECTED")
 
@@ -3538,11 +3710,131 @@ class BusinessVerificationRulesTest(TestCase):
         workbook = ExcelValidationListExporter(
             ExcelValidationListExporterTest()._selection_result(), "batch-1",
         ).export_workbook()
+        worksheet = workbook[VALIDATION_LIST_SHEET]
+        headers = [cell.value for cell in worksheet[1]]
         for column in ("participant_status", "household_status"):
-            cell = workbook[VALIDATION_LIST_SHEET].cell(2, EXCEL_COLUMNS.index(column) + 1)
+            cell = worksheet.cell(2, headers.index(column) + 1)
             self.assertEqual(cell.data_type, "f")
             self.assertTrue(cell.protection.locked)
         self.assertEqual(workbook.calculation.calcMode, "auto")
+
+
+class PwpVerificationRulesTest(TestCase):
+    def setUp(self):
+        patcher = patch.object(HouseholdValidationConfig, "business_columns_enabled", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_pwp_verification_depends_only_on_primary_worker(self):
+        from household_validation.verification import participant_status, household_status
+
+        for business in (None, "No", "Yes"):
+            for worker, expected in ((True, "VERIFIED"), (False, "NOT_VERIFIED"), (None, "NOT_VERIFIED")):
+                with self.subTest(worker=worker, business=business):
+                    self.assertEqual(participant_status(
+                        worker, business, business_columns_enabled=False,
+                    ), expected)
+                    self.assertEqual(household_status(
+                        [(worker, business), (False, "Yes")], business_columns_enabled=False,
+                    ), expected)
+        self.assertEqual(household_status(
+            [(True, None), (True, None)], business_columns_enabled=False,
+        ), "REJECTED")
+
+    def test_pwp_generated_workbook_upload_matches_dry_run_and_saved_statuses(self):
+        fixture = ExcelValidationListExporterTest()
+        for worker in ("YES", " yes ", "Y", "TRUE", "1", "NO", None):
+            with self.subTest(worker=worker):
+                verified = worker not in ("NO", None)
+                expected = "VERIFIED" if verified else "NOT_VERIFIED"
+                workbook = ExcelValidationListExporter(
+                    fixture._selection_result(member_count=2), "batch-1",
+                ).export_workbook()
+                sheet = workbook[VALIDATION_LIST_SHEET]
+                fixture._cell(sheet, "primary_worker").value = worker
+                # Upload must recompute decisions, not trust status cells.
+                for row in (2, 3):
+                    for column in ("participant_status", "household_status"):
+                        fixture._cell(sheet, column, row).value = "FORGED"
+                content = ValidationUploadParserTest()._workbook_bytes(workbook)
+                individuals = [SimpleNamespace(
+                    id=f"member-{n}", json_ext={"business_experience": "Yes", "business_period": 2},
+                ) for n in (1, 2)]
+                members = [SimpleNamespace(
+                    individual_id=individual.id, individual=individual, is_deleted=False,
+                ) for individual in individuals]
+                group = SimpleNamespace(
+                    id="group-1", json_ext={}, save=MagicMock(),
+                    _prefetched_objects_cache={"groupindividuals": members},
+                )
+                service = HouseholdValidationUploadService()
+                with (
+                    patch.object(service, "_group", return_value=group),
+                    patch.object(service, "_structural_errors", return_value=[]),
+                    patch.object(service, "_get_or_create_batch", return_value=MagicMock()) as batch,
+                    patch.object(service, "_replace_primary_worker", return_value=False) as replace_worker,
+                    patch.object(service, "_save_batch_row"),
+                    patch("household_validation.services.IndividualService") as individual_service,
+                    patch("household_validation.services.transaction.atomic", return_value=nullcontext()),
+                ):
+                    dry_run = service.upload(content, dry_run=True)
+                    batch.assert_not_called()
+                    individual_service.assert_not_called()
+                    result = service.upload(content)
+                self.assertEqual(result["errors"], 0, result["error_messages"])
+                for key, count in {
+                    "participants_verified": int(verified),
+                    "participants_not_verified": 2 - int(verified),
+                    "participants_rejected": 0,
+                    "households_verified": int(verified),
+                    "households_not_verified": int(not verified),
+                    "households_rejected": 0,
+                }.items():
+                    self.assertEqual(result[key], count)
+                    self.assertEqual(dry_run[key], count)
+                self.assertEqual(individuals[0].json_ext["validation_status"], expected)
+                self.assertEqual(individuals[1].json_ext["validation_status"], "NOT_VERIFIED")
+                self.assertEqual(group.json_ext["validation_status"], expected)
+                self.assertEqual(replace_worker.call_count, int(verified))
+                for individual in individuals:
+                    self.assertEqual(individual.json_ext["business_experience"], "Yes")
+                    self.assertEqual(individual.json_ext["business_period"], 2)
+
+    def test_pwp_upload_rejects_multiple_primary_workers_without_updates(self):
+        fixture = ExcelValidationListExporterTest()
+        workbook = ExcelValidationListExporter(
+            fixture._selection_result(member_count=2), "batch-1",
+        ).export_workbook()
+        sheet = workbook[VALIDATION_LIST_SHEET]
+        for row in (2, 3):
+            fixture._cell(sheet, "primary_worker", row).value = "YES"
+        content = ValidationUploadParserTest()._workbook_bytes(workbook)
+        members = [SimpleNamespace(
+            individual_id=f"member-{n}", is_deleted=False,
+            individual=SimpleNamespace(id=f"member-{n}", json_ext={}),
+        ) for n in (1, 2)]
+        group = SimpleNamespace(
+            id="group-1", json_ext={},
+            _prefetched_objects_cache={"groupindividuals": members},
+        )
+        service = HouseholdValidationUploadService()
+        with (
+            patch.object(service, "_group", return_value=group),
+            patch.object(service, "_structural_errors", return_value=[]),
+            patch.object(service, "_get_or_create_batch", return_value=MagicMock()),
+            patch.object(service, "_save_primary_worker_rejection"),
+            patch.object(service, "_apply_row") as apply_row,
+            patch.object(service, "_replace_primary_worker") as replace_worker,
+            patch("household_validation.services.transaction.atomic", return_value=nullcontext()),
+        ):
+            dry_run = service.upload(content, dry_run=True)
+            result = service.upload(content)
+        apply_row.assert_not_called()
+        replace_worker.assert_not_called()
+        for summary in (dry_run, result):
+            self.assertEqual(summary["households_rejected"], 1)
+            self.assertEqual(summary["participants_rejected"], 2)
+            self.assertEqual(summary["households_verified"], 0)
 
 
 class LocalDateTests(TestCase):

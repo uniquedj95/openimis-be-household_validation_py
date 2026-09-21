@@ -63,7 +63,10 @@ def _json_safe(value):
 
 class HouseholdValidationUploadService:
     def __init__(self, user=None):
+        from household_validation.apps import HouseholdValidationConfig
+
         self.user = user
+        self.business_columns_enabled = HouseholdValidationConfig.business_columns_enabled
         self._group_cache = {}
         self._upload_attempt_id = None
         self._member_details_changed_group_ids = set()
@@ -113,7 +116,10 @@ class HouseholdValidationUploadService:
                 decision_rows.setdefault(group_key, []).append(
                     (row.primary_worker, row.values.get(HAS_BUSINESS_COLUMN))
                 )
-        decisions = {key: household_status(rows) for key, rows in decision_rows.items()}
+        decisions = {
+            key: household_status(rows, business_columns_enabled=self.business_columns_enabled)
+            for key, rows in decision_rows.items()
+        }
         totals["households_rejected"] = sum(
             status == REJECTED for status in decisions.values()
         )
@@ -130,7 +136,11 @@ class HouseholdValidationUploadService:
                 ),
                 household_status=decisions.get(self._uploaded_group_key(uploaded_row)),
                 participant_status=(
-                    participant_status(uploaded_row.primary_worker, uploaded_row.values.get(HAS_BUSINESS_COLUMN))
+                    participant_status(
+                        uploaded_row.primary_worker,
+                        uploaded_row.values.get(HAS_BUSINESS_COLUMN),
+                        business_columns_enabled=self.business_columns_enabled,
+                    )
                     if self._uploaded_group_key(uploaded_row) in participant_update_group_keys
                     else None
                 ),
@@ -299,7 +309,7 @@ class HouseholdValidationUploadService:
                 statuses[group_key] = household_status([
                     (row.primary_worker, row.values.get(HAS_BUSINESS_COLUMN))
                     for row in group_rows
-                ]) == VERIFIED
+                ], business_columns_enabled=self.business_columns_enabled) == VERIFIED
         return statuses
 
     def _primary_worker_rejections(

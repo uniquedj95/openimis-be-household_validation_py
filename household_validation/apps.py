@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     "female_headed_percentage": 40,
     "youth_percentage": 40,
     "reserve_percentage": 20,
+    "business_columns_enabled": False,
     "business_type_options": DEFAULT_BUSINESS_TYPE_OPTIONS,
 }
 
@@ -99,6 +100,7 @@ class HouseholdValidationConfig(AppConfig):
     female_headed_percentage = None
     youth_percentage = None
     reserve_percentage = None
+    business_columns_enabled = DEFAULT_CONFIG["business_columns_enabled"]
     business_type_options = None
 
     @classmethod
@@ -106,6 +108,8 @@ class HouseholdValidationConfig(AppConfig):
         """
         Load config fields that match current AppConfig class fields.
         """
+        # Existing deployments may have configuration saved before this flag.
+        cls.business_columns_enabled = DEFAULT_CONFIG["business_columns_enabled"]
         for field in cfg:
             if hasattr(cls, field):
                 setattr(cls, field, cfg[field])

@@ -89,6 +89,48 @@ It also exposes the selection quota percentages used by the algorithm described 
 
 There is intentionally no `other_percentage` key — the "other" quota is always derived as `100% - femaleHeadedPercentage - youthPercentage`, so it stays correct however the two configured values are changed.
 
+## Business columns per deployment
+
+`business_columns_enabled` controls business collection in newly generated validation
+workbooks. It defaults to `false`, including when the key is missing from an existing
+`household_validation` module configuration, so PWP workbooks omit:
+
+- Does member has a business
+- Type of Business
+- Business Period (in years)
+- The hidden Business Type Options worksheet and its business dropdowns/validation rules
+
+For Jobs-Now/RMEP, merge this setting into the existing `ModuleConfiguration` for
+`household_validation`, preserving its other configuration keys:
+
+```json
+{
+  "business_columns_enabled": true
+}
+```
+
+Use JSON booleans (`true`/`false`), not strings. `business_type_options` continues to
+configure the business choices when enabled. Restart the backend after updating the
+configuration and generate a new workbook. No database schema migration or frontend
+change is required. Primary Worker and Project dropdowns remain available in both modes.
+
+The flag controls workbook generation and the verification policy used during upload.
+Previously issued workbooks with or without business columns remain uploadable; missing
+columns preserve stored business data. The server configuration selects the policy,
+not the presence of columns or status values in an uploaded workbook.
+
+- PWP (`false`): Primary Worker `YES` makes that participant `VERIFIED`; `NO` or blank
+  makes them `NOT_VERIFIED`. Exactly one primary worker makes the household `VERIFIED`,
+  with that household status shown on all its rows. No primary worker means
+  `NOT_VERIFIED`; multiple primary workers mean `REJECTED` and block household updates.
+  Business answers are not required for verification, and selecting a primary worker
+  does not create or overwrite stored business answers.
+- Jobs-Now/RMEP (`true`): use the business verification rules described below.
+  A primary worker still needs a Business `Yes` or `No` answer to be verified.
+
+Excel/LibreOffice formulas, upload dry-run counts, and persisted statuses use the same
+deployment policy. Regenerate old PWP workbooks to obtain the updated formulas.
+
 ## GraphQL Backend Testing
 
 Test the backend through the GraphQL fields exposed in `household_validation/schema.py`. The frontend should use these same operations.
@@ -337,15 +379,15 @@ Expected upload behavior:
 - Generated workbooks hide internal `batch_id`, `group_uuid`, `member_uuid`, `row_type`, and `project_id` columns. Their locked values remain in the file for upload matching and household formulas. Form Number and National ID remain visible. Do not delete the hidden columns.
 
 - `rowsRead` counts every non-empty participant row encountered in the workbook, including rows that later fail validation.
-- Generated workbooks contain protected `participant_status` and `household_status` formulas that recalculate as officers fill the sheet. Upload recomputes these statuses from inputs, ignoring uploaded status values. For each member: Primary Worker `Yes` with Business `Yes` or `No` is `VERIFIED`; Primary Worker `Yes` with Business blank is `NOT_VERIFIED`; Primary Worker `No`/blank with Business `Yes` is `REJECTED`. Other combinations are `NOT_VERIFIED`.
-- A household is `REJECTED` if any member is rejected or more than one primary worker is selected. Otherwise it is `VERIFIED` if it has a verified primary worker, and `NOT_VERIFIED` otherwise. A member's own status remains independent of other members' results. Missing business columns in older files count as blank for verification, while preserving stored business data.
+- Generated workbooks contain protected `participant_status` and `household_status` formulas that recalculate as officers fill the sheet. Upload recomputes these statuses from inputs, ignoring uploaded status values. In PWP, Primary Worker `Yes` is enough to verify the participant. With business columns enabled (Jobs-Now), Primary Worker `Yes` with Business `No`, or Business `Yes` with a configured type and valid period, is `VERIFIED`. Missing answers/details are `NOT_VERIFIED`. Non-primary workers are `NOT_VERIFIED`; business answers on those rows are upload errors that block household updates.
+- A household is `REJECTED` if any member is rejected or more than one primary worker is selected. Otherwise it is `VERIFIED` if it has a verified primary worker, and `NOT_VERIFIED` otherwise. A member's own status remains independent of other members' results. Missing business columns in older files count as blank for Jobs-Now verification; PWP verification does not depend on business answers. Missing columns preserve stored business data in both modes.
 - Primary Worker dropdowns allow at most one `YES` per household, matched by hidden `group_uuid` across the whole sheet. When another member is `YES`, only `NO` is available and a Stop error blocks typing a second `YES`. Clear the current selection or change it to `NO` before selecting a different worker. Conflicting `YES` cells are highlighted red if pasted data bypasses validation; upload retains its existing household rejection check.
-- Generated workbooks always leave `primary_worker`, Does member has a business, Type of Business, Business Period, and `validation_notes` blank for fresh field collection, even when saved answers exist. Export does not change those saved answers or suggest a Primary Worker from `recipient_type`.
-- The Business cell displays input guidance to select Primary Worker first. Its Yes/No dropdown becomes available only after Primary Worker is answered `YES` or `NO` on that row. A Stop error rejects manually entered business answers while Primary Worker is blank. The guidance appears whenever the Business cell is selected; the blocking error appears on invalid entry. Generate a new workbook to receive these validation rules.
+- Generated workbooks always leave `primary_worker`, `validation_notes`, and any enabled business columns blank for fresh field collection, even when saved answers exist. Export does not change those saved answers or suggest a Primary Worker from `recipient_type`.
+- Business fields require Primary Worker `YES`. Business Type and Period also require Business `Yes`; Period requires a selected type. Unavailable cells retain the household row colours, have no applicable dropdown choices and reject invalid typed entries. Existing values become red when their prerequisites are removed; clear them before uploading. This is validation, not dynamic cell protection or automatic clearing. Upload enforces the worker prerequisite even when copy/paste bypasses workbook rules. Generate a new workbook to receive these rules.
 - Participant rows are grouped visually by alternating green and light-green fills; every row belonging to the same household uses the same fill.
 - `participantsVerified`, `participantsNotVerified`, and `participantsRejected` count unique members by their calculated status. Existing multiple-primary-worker rejections count the conflicting primary workers as rejected and block changes for that household. Invalid households are excluded from verification counts.
-- `householdsRejected` counts both business-rule and multiple-primary-worker rejections. `householdsWithMultiplePrimaryWorkers` retains its narrower meaning. Clients must request `householdsRejected` to display the full rejected-household count.
-- For business-rule rejections, upload saves the collected member fields and member/household `validation_status = REJECTED` as applicable, and records rejected household rows in the audit and downloadable rejection report. These decisions do not count as upload errors. Dry runs report the same decisions without saving.
+- Multiple-primary-worker conflicts remain household rejections. Business information on a non-primary worker is a correctable upload error, excluded from verification counts until corrected.
+- Historical business-rule rejection records remain available in audit and rejection downloads. New invalid business entries do not save participant changes for the affected household.
 - Rejected rows use a dedicated `REJECTED` audit status and are excluded from system error reports.
 - For a verified household, upload atomically clears every existing Primary Worker assignment before assigning the selected participant. This includes active household members not present in the workbook and does not change `recipient_type`.
 - Not-verified and rejected households preserve existing Primary Worker assignments. With more than one `YES`, the household is rejected and no member updates are made.
