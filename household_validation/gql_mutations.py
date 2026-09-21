@@ -60,6 +60,7 @@ class HouseholdValidationUploadResultGQLType(graphene.ObjectType):
     participants_not_verified = graphene.Int()
     participants_rejected = graphene.Int()
     households_not_verified = graphene.Int()
+    households_rejected = graphene.Int()
     participant_updates = graphene.Int()
     households_with_multiple_primary_workers = graphene.Int()
     errors = graphene.Int()

@@ -1,18 +1,24 @@
 from dataclasses import dataclass, field
 import csv
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from io import StringIO
 
 from openpyxl import load_workbook
 
 from household_validation.excel import (
+    BUSINESS_DURATION_COLUMN,
+    BUSINESS_TYPE_COLUMN,
     EXCEL_COLUMNS,
+    HAS_BUSINESS_COLUMN,
     PROJECT_OPTIONS_SHEET,
     PROJECT_OPTIONS_HEADERS,
+    _configured_business_type_options,
 )
 from household_validation.identity import get_household_form_number
 from household_validation.wealth import get_household_wealth_quintile
+from household_validation.verification import PARTICIPANT_STATUS_COLUMN, HOUSEHOLD_STATUS_COLUMN
 
 
 VALIDATION_LIST_SHEET = "Validation List"
@@ -25,13 +31,21 @@ EDITABLE_UPLOAD_COLUMNS = {
     "primary_worker",
     "project",
     "validation_notes",
+    HAS_BUSINESS_COLUMN,
+    BUSINESS_TYPE_COLUMN,
+    BUSINESS_DURATION_COLUMN,
 }
 OPTIONAL_UPLOAD_COLUMNS = {
+    PARTICIPANT_STATUS_COLUMN,
+    HOUSEHOLD_STATUS_COLUMN,
     "Micro-Catchment",
     "Hotspot",
     "marital_status",
     "disability",
     "pmt_score",
+    HAS_BUSINESS_COLUMN,
+    BUSINESS_TYPE_COLUMN,
+    BUSINESS_DURATION_COLUMN,
 }
 REQUIRED_UPLOAD_COLUMNS = tuple(
     column for column in EXCEL_COLUMNS if column not in OPTIONAL_UPLOAD_COLUMNS
@@ -54,6 +68,9 @@ class UploadedValidationRow:
     project_name: str | None
     project_id: str | None
     notes: str | None
+    business_updates: dict = field(default_factory=dict)
+    participant_status: str | None = None
+    household_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,13 +92,19 @@ class WorkbookParseResult:
 
 
 def parse_validation_workbook(file_or_bytes):
+    from household_validation.apps import HouseholdValidationConfig
+
+    business_columns_enabled = HouseholdValidationConfig.business_columns_enabled
     workbook = load_workbook(_to_bytes_io(file_or_bytes), data_only=True)
     errors = []
     if VALIDATION_LIST_SHEET not in workbook.sheetnames:
         return WorkbookParseResult(errors=[f"Missing worksheet: {VALIDATION_LIST_SHEET}"])
 
     worksheet = workbook[VALIDATION_LIST_SHEET]
-    headers = _read_headers(worksheet)
+    try:
+        headers = _read_headers(worksheet)
+    except ValueError as exc:
+        return WorkbookParseResult(errors=[str(exc)])
     missing_columns = [
         column for column in REQUIRED_UPLOAD_COLUMNS if column not in headers
     ]
@@ -110,7 +133,17 @@ def parse_validation_workbook(file_or_bytes):
             continue
         total_rows_read += 1
         row_errors = _validate_structural_values(row_number, values)
+        business_updates, business_errors = _parse_business_values(row_number, values)
+        row_errors.extend(business_errors)
         primary_worker = _parse_yes_no(values.get("primary_worker"))
+        if business_columns_enabled and primary_worker is not True and any(
+            _clean(values.get(column)) is not None
+            for column in (HAS_BUSINESS_COLUMN, BUSINESS_TYPE_COLUMN, BUSINESS_DURATION_COLUMN)
+        ):
+            row_errors.append(
+                f"Row {row_number}: business information is only available for the selected "
+                "Primary Worker. Clear all three business fields or select Primary Worker YES."
+            )
         validation_date = _parse_date(values.get("validation_date"))
         project_label = _clean(values.get("project"))
         project_name = _resolve_project_name(project_label, project_options)
@@ -148,6 +181,7 @@ def parse_validation_workbook(file_or_bytes):
                 project_name=project_name,
                 project_id=project_id,
                 notes=_clean(values.get("validation_notes")),
+                business_updates=business_updates,
             )
         )
     return WorkbookParseResult(
@@ -172,12 +206,74 @@ def _to_bytes_io(file_or_bytes):
 
 
 def _read_headers(worksheet):
+    def normalize(value):
+        return " ".join(value.replace("_", " ").split()).casefold()
+
+    canonical = {normalize(column): column for column in EXCEL_COLUMNS}
+    canonical.update({
+        "business experience": HAS_BUSINESS_COLUMN,
+        "has business": HAS_BUSINESS_COLUMN,
+        "does member have a business": HAS_BUSINESS_COLUMN,
+        "type of business": BUSINESS_TYPE_COLUMN,
+        "business type": BUSINESS_TYPE_COLUMN,
+        "business period": BUSINESS_DURATION_COLUMN,
+    })
     headers = {}
     for column_number in range(1, worksheet.max_column + 1):
         value = _clean(worksheet.cell(row=1, column=column_number).value)
         if value:
+            value = canonical.get(normalize(value), value)
+            if value in headers:
+                raise ValueError(f"Duplicate column: {value}")
             headers[value] = column_number
     return headers
+
+
+def _parse_business_values(row_number, values):
+    updates = {}
+    errors = []
+    has_business = _clean(values.get(HAS_BUSINESS_COLUMN))
+    business_type = _clean(values.get(BUSINESS_TYPE_COLUMN))
+    period = _clean(values.get(BUSINESS_DURATION_COLUMN))
+    if has_business:
+        flag = _parse_yes_no(has_business)
+        if flag is None:
+            errors.append(f"Row {row_number}: {HAS_BUSINESS_COLUMN} must be YES or NO")
+        else:
+            updates["business_experience"] = "Yes" if flag else "No"
+    if business_type:
+        options = {option.casefold(): option for option in _configured_business_type_options()}
+        if business_type.casefold() not in options:
+            errors.append(f"Row {row_number}: {BUSINESS_TYPE_COLUMN} is not a configured business type")
+        else:
+            updates["type_of_business"] = options[business_type.casefold()]
+    if updates.get("business_experience") == "Yes":
+        if not business_type:
+            errors.append(
+                f"Row {row_number}: {BUSINESS_TYPE_COLUMN} is required when {HAS_BUSINESS_COLUMN} is Yes"
+            )
+        if not period:
+            errors.append(
+                f"Row {row_number}: {BUSINESS_DURATION_COLUMN} is required when {HAS_BUSINESS_COLUMN} is Yes"
+            )
+    if period:
+        try:
+            number = Decimal(period)
+            if not number.is_finite() or not 0 <= number <= 100:
+                raise ValueError
+            updates["business_period"] = float(number)
+        except (InvalidOperation, ValueError):
+            errors.append(f"Row {row_number}: {BUSINESS_DURATION_COLUMN} must be between 0 and 100")
+        if not business_type:
+            errors.append(
+                f"Row {row_number}: select {BUSINESS_TYPE_COLUMN} before entering {BUSINESS_DURATION_COLUMN}"
+            )
+    if updates.get("business_experience") == "No":
+        # Changing Yes to No must also remove previously stored business details.
+        updates.update(type_of_business=None, business_period=None)
+    elif (business_type or period) and updates.get("business_experience") != "Yes":
+        errors.append(f"Row {row_number}: select Yes for {HAS_BUSINESS_COLUMN} before entering business details")
+    return updates, errors
 
 
 def _read_project_options(workbook):
@@ -275,7 +371,7 @@ def _resolve_project_id(project_label, workbook_project_id, project_options):
 
 def build_validation_json_ext(uploaded_row, project, upload_date, uploaded_at, user_id):
     validation_date = uploaded_row.validation_date or upload_date
-    validation_status = (
+    validation_status = uploaded_row.household_status or (
         VALIDATION_STATUS_VERIFIED
         if uploaded_row.verified is True
         else VALIDATION_STATUS_NOT_VERIFIED
