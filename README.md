@@ -45,14 +45,17 @@ The integration extension also implements the backend surface required by the va
 - Shared selection behavior for preview and Excel export (`generateHouseholdValidationList`'s response embeds the same summary counts, so no separate summary query is needed).
 - Region, district, TA/municipality, GVH, village, hotspot, and micro-catchment filter support.
 - Quota-based main-list selection plus a reserve/waiting list — see "Selection Algorithm" below.
+- Config-driven, backend-only eligibility rules and a simpler target-count selection for program-based deployments (e.g. Jobs Now) via `benefitPlanCode` — see "Program-Based Selection" below.
 
 Enrollment remains a reference workflow only. This module does not call enrollment mutations and does not create `GroupBeneficiaryProjectEnrollment` records.
 
 ## Selection Algorithm
 
-`household_validation/selection.py::select_households` is the single implementation behind `generateHouseholdValidationList`, `householdValidationPreview`, and the Excel export, so all three always describe the same selection. It runs in this order:
+`household_validation/selection.py::select_households` is the single implementation behind `generateHouseholdValidationList`, `householdValidationPreview`, and the Excel export, so all three always describe the same selection. It takes a `rule`, resolved from the `program_eligibility_rules` module configuration (see "Permissions" below) for the selected Program — falling back to that config's `"PWP"` entry when no Program is selected or none matches. Whether the rule has a `selection_strategy` key picks the algorithm: present (a dict of quota settings, PWP's) or absent (program-based, e.g. Jobs Now — see "Program-Based Selection" below).
 
-1. **Sort.** Eligible households (at least one fit-for-work member; not excluded by `excludeVerifiedAfter`) are sorted by `household_wealth_quintile` ascending — `Poorest` first, `Richest` last. This quintile is the available proxy for PMT score (there is no separate numeric PMT field on the household); households within the same quintile are ordered by code/id.
+**With `selection_strategy` present**, the algorithm runs in this order:
+
+1. **Sort.** Eligible households (at least one member matching the rule; not excluded by `excludeVerifiedAfter`) are sorted by `household_wealth_quintile` ascending — `Poorest` first, `Richest` last. This quintile is the available proxy for PMT score (there is no separate numeric PMT field on the household); households within the same quintile are ordered by code/id.
 2. **Categorize.** Each household is tagged with exactly one category: `FEMALE_HEADED` (head is female), `YOUTH` (no female head, but at least one eligible member aged 18-35), or `OTHER` (neither).
 3. **Allocate the target between villages.** For micro-catchment and hotspot requests with an explicit `targetCount`, eligible households are grouped by village and the target is distributed proportionally using the largest-remainder method. When the target is at least the number of villages containing eligible households, every such village receives at least one place. Rounding always preserves the exact overall target. Requests outside micro-catchment/hotspot selection retain the original catchment-wide pool behavior.
 4. **Split each village allocation into category quotas.** Each village's requested main-list size is split into three quotas by percentage: **40% female-headed, 40% youth-headed, 20% other**, by default. Only the female-headed and youth-headed percentages are configured values (see below) — there is no separate "other" percentage setting anywhere. The "other" quota is *always computed live* as `100% - femaleHeadedPercentage - youthPercentage`. If the two configured percentages together exceed 100%, they're scaled down proportionally so their sum is exactly 100% and "other" is 0%.
@@ -60,7 +63,18 @@ Enrollment remains a reference workflow only. This module does not call enrollme
 6. **Backfill any shortfall.** If a category's pool cannot fill its quota, the gap is filled from the remaining eligible households in the same village, still in PMT order. Proportional allocation is capacity-aware, so the combined main list reaches `targetCount` whenever the selected area contains enough eligible households.
 7. **Build the reserve/waiting list.** Reserve places default to **20%** of the main-list target and are distributed proportionally across villages from households not selected for the main list. Main and reserve households cannot overlap.
 
-None of the three percentages are GraphQL arguments on `generateHouseholdValidationList` — they're read from `ModuleConfiguration` for the `household_validation` module (see the "Permissions" section below), so they can be retuned without a code deploy.
+None of the three percentages are GraphQL arguments on `generateHouseholdValidationList` — they're read from the rule (see "Permissions" below), so they can be retuned without a code deploy.
+
+### Program-Based Selection (e.g. Jobs Now)
+
+`generateHouseholdValidationList`/`householdValidationPreview` accept an optional `benefitPlanCode` argument (the Program's benefit plan code, e.g. `RMEP` or `UPG`). When it matches an entry in the `program_eligibility_rules` module configuration that has **no `selection_strategy` key** (see "Permissions" below), `select_households` runs a deliberately simpler path instead of the quota algorithm above:
+
+- **Eligibility is program-specific and stricter.** In addition to the location filters, a household needs at least one member matching the resolved rule — see the `program_eligibility_rules` keys documented under "Permissions". This check lives on `EligibleMember.is_eligible(rule)` (`household_validation/selection.py`), evaluated against fields captured once per member (`data_source`, `recipient_type`, `json_ext`, `dob`/`age`) when the member is built.
+- **No wealth ranking, no PMT proxy, no demographic quotas.** `wealth_quintile`/`pmt_score` are not even computed when `selection_strategy` is absent (`EligibleHouseholdSelectionService._build_household` skips those lookups), and there's no `FEMALE_HEADED`/`YOUTH`/`OTHER` categorization or village-proportional allocation.
+- **Ordering** is by the rule's `priority_flag`, if any: households with a qualifying member carrying that `json_ext` flag sort first (e.g. RMEP's `business_experience`); everything else follows in a stable, deterministic order (currently by household code/id — a placeholder until a real business-relevance score is defined).
+- **The main list is simply the first `targetCount` households** from that ordering — **there is no reserve/waiting list** in this mode. Households beyond `targetCount` are not selected at all (unlike the quota algorithm's 20%-of-target reserve pool).
+
+Deployments that never send `benefitPlanCode` (or send one with no matching rule) always resolve to the `"PWP"` rule, which has `selection_strategy` set, so they always run the quota algorithm described above.
 
 ## Permissions
 
@@ -81,13 +95,45 @@ The module configuration exposes these GraphQL permission keys:
 - `gql_query_household_validation_history_perms`
 - `gql_query_household_validation_error_report_perms`
 
-It also exposes the selection quota percentages used by the algorithm described in "Selection Algorithm" above (these are no longer accepted as GraphQL arguments; update `ModuleConfiguration` for the `household_validation` module to change them):
+It also exposes `program_eligibility_rules`, which drives every selection algorithm described in "Selection Algorithm" above (none of these values are GraphQL arguments on `generateHouseholdValidationList`; update `ModuleConfiguration` for the `household_validation` module to change them):
 
-- `female_headed_percentage` (default `40`)
-- `youth_percentage` (default `40`)
-- `reserve_percentage` (default `20`, applied to the main-list size to size the reserve/waiting list)
+- `program_eligibility_rules`: a dict keyed by benefit plan code (matched case-insensitively against the `benefitPlanCode` GraphQL argument), including a `"PWP"` entry used whenever `benefitPlanCode` is absent or matches nothing. Each value is a rule with these optional keys:
+  - `selection_strategy`: **presence, not its value, is what matters.** Given as a dict, PWP's wealth-ranked, demographic-quota algorithm runs, configured by that dict's own keys (below). Omitted entirely, the simple algorithm runs instead — see "Program-Based Selection" above.
+    - `female_headed_percentage` (default `40`) / `youth_headed_percentage` (default `40`) / `reserve_percentage` (default `20`): the demographic quota split and reserve-list size, applied to the main-list target. There is intentionally no `other_percentage` key — the "other" quota is always derived as `100% - female_headed_percentage - youth_headed_percentage`, so it stays correct however the two configured values are changed.
+  - `requires_data_source`: a member's `Individual.json_ext["data_source"]` must equal this value (case-insensitive) — a hard requirement.
+  - `requires_recipient_type`: a member's `GroupIndividual.recipient_type` (`PRIMARY`/`SECONDARY`) must equal this value — a hard requirement.
+  - `member_flag`: an `Individual.json_ext` boolean key a member must also have — a hard requirement.
+  - `member_min_age` / `member_max_age`: inclusive age bounds (derived from `Individual.dob`) a member must also fall within — a hard requirement.
+  - `priority_flag`: (meaningful only when `selection_strategy` is absent) an `Individual.json_ext` boolean key that does **not** gate eligibility — it only ranks otherwise-eligible households ahead of the rest of the pool once the selection is capped at `targetCount`.
 
-There is intentionally no `other_percentage` key — the "other" quota is always derived as `100% - femaleHeadedPercentage - youthPercentage`, so it stays correct however the two configured values are changed.
+  Default configuration (`household_validation/apps.py::DEFAULT_CONFIG`):
+
+  ```python
+  "program_eligibility_rules": {
+      "PWP": {
+          "member_flag": "fit_for_work",
+          "selection_strategy": {
+              "female_headed_percentage": 40,
+              "youth_headed_percentage": 40,
+              "reserve_percentage": 20,
+          },
+      },
+      "RMEP": {
+          "requires_data_source": "PWP",
+          "priority_flag": "business_experience",
+      },
+      "UPG": {
+          "requires_data_source": "SCTP",
+          "member_flag": "fit_for_work",
+          "member_min_age": 18,
+          "member_max_age": 60,
+      },
+  }
+  ```
+
+  In words: **PWP** requires a fit-for-work member, selected via the 40/40/20 wealth-ranked quota algorithm. **RMEP** requires a PWP-sourced member — households with such a member qualify whether or not that member also has business experience, but business-experienced households are selected first (up to `targetCount`) before any other PWP-sourced household fills the remaining slots. **UPG** requires an SCTP-sourced member who is fit for work and aged 18-60.
+
+  This key is intentionally **not exposed to the frontend**: this module's `ModuleConfiguration` row keeps the default `is_exposed = False`, and `resolve_module_configurations` (`openimis-be-core_py/core/schema.py`) only ever returns rows with `is_exposed = True` to GraphQL callers. A deployment overrides it by updating (or inserting) the `household_validation` module's `ModuleConfiguration` row directly (e.g. via Django admin), leaving `is_exposed` unchecked. A deployment override **replaces the whole `program_eligibility_rules` dict** (it isn't deep-merged with the default), so an override that only tweaks, say, RMEP must still include its own `"PWP"` entry if PWP-style generation is also used on that deployment.
 
 ## Business columns per deployment
 
@@ -163,8 +209,9 @@ Preview and export should receive the same filter payload so they describe the s
 - `catchmentId` or `catchmentCode` (micro-catchment)
 - `excludeVerifiedAfter`
 - `targetCount`
+- `benefitPlanCode` (the Program's benefit plan code, e.g. `RMEP`/`UPG` — see "Program-Based Selection" above; omit it for the default PWP algorithm)
 
-`ta` maps to the municipality/TA level in the location hierarchy. `hotspotId`/`hotspotCode` resolve to a `location.Hotspot` and scope selection to its linked villages; `catchmentId`/`catchmentCode` resolve to a `location.MicroCatchment` and scope selection to its linked TAs and GVHs. Only one location filter tier applies per request — the most specific one supplied wins, in this order: village > GVH > hotspot > TA > micro-catchment > district > region. Selection quota percentages (female-headed, youth, reserve) are no longer request arguments — they come from `ModuleConfiguration` (see above).
+`ta` maps to the municipality/TA level in the location hierarchy. `hotspotId`/`hotspotCode` resolve to a `location.Hotspot` and scope selection to its linked villages; `catchmentId`/`catchmentCode` resolve to a `location.MicroCatchment` and scope selection to its linked TAs and GVHs. Only one location filter tier applies per request — the most specific one supplied wins, in this order: village > GVH > hotspot > TA > micro-catchment > district > region. Selection quota percentages (female-headed, youth, reserve) are no longer request arguments — they come from `ModuleConfiguration` (see above), as is `benefitPlanCode`'s eligibility rule (`program_eligibility_rules`).
 
 Project dropdown query:
 
@@ -210,6 +257,25 @@ mutation {
 ```
 
 The response `fileBase64` is the Excel workbook content. The frontend should decode it for download.
+
+Generate for a program-based (e.g. Jobs Now) deployment instead by adding `benefitPlanCode`; the response shape is identical, but `selectedFemaleHeadedHouseholds`/`selectedYouthHouseholds` are always `0` and `reserveHouseholds` is always `0` for these requests (see "Program-Based Selection" above):
+
+```graphql
+mutation {
+  generateHouseholdValidationList(
+    districtCode: "DISTRICT_CODE"
+    benefitPlanCode: "RMEP"
+    targetCount: 100
+  ) {
+    batchId
+    fileName
+    fileBase64
+    selectedHouseholds
+    selectedIndividuals
+    generatedAt
+  }
+}
+```
 
 These fields map to the validation-list summary cards:
 
@@ -412,11 +478,17 @@ Implemented and verified in the integration extension:
 - `generateHouseholdValidationList` and `householdValidationPreview` accept the same region/location filters.
 - Generation and preview share the same eligible-household selection service.
 - Region filtering is supported in addition to district/TA/village filtering.
-- Female-headed, youth, and reserve quota percentages are configured via `ModuleConfiguration` (default 40/40/20 main quotas, 20% reserve) rather than passed as request arguments.
+- Female-headed, youth, and reserve quota percentages are configured via `ModuleConfiguration`'s `program_eligibility_rules["PWP"]` (default 40/40/20 main quotas, 20% reserve) rather than passed as request arguments.
 - Percentage over-allocation is normalized so selection cannot exceed the requested target.
 - Households are sorted poorest-first by wealth quintile (PMT proxy) before quotas are applied, and the reserve/waiting list continues in that same order past the main list rather than being re-sorted.
 - Hotspot and micro-catchment filters (`hotspotId`/`hotspotCode`, `catchmentId`/`catchmentCode`) scope selection to a `location.Hotspot`'s villages or a `location.MicroCatchment`'s TAs/GVHs.
 - Upload and export behavior still do not create enrollment records.
+
+Implemented, but **not yet run through the test suite** (added without a working local Django/DB environment for this module — see caveat below):
+
+- `benefitPlanCode` on `generateHouseholdValidationList`/`householdValidationPreview` selects a `program_eligibility_rules` rule (`ModuleConfiguration`, not exposed to the frontend) instead of the `"PWP"` one.
+- `select_households` is a single function driven by whether the resolved rule's `selection_strategy` key is present: a dict (PWP's wealth/demographic-quota allocation, percentages read from that dict) or absent (program-based — no wealth/PMT computation, ordered by `priority_flag`, capped at `targetCount` with no reserve list).
+- PWP's female-headed/youth/reserve percentages moved from flat `female_headed_percentage`/`youth_headed_percentage`/`reserve_percentage` `ModuleConfiguration` keys into `program_eligibility_rules["PWP"]["selection_strategy"]`; `household_validation/tests.py` was updated to pass a `rule={"selection_strategy": {...}}` argument to `select_households` in place of the old `patch.object(HouseholdValidationConfig, "...")` calls.
 
 Local verification commands:
 
@@ -429,12 +501,14 @@ cd openimis-be_py/openIMIS
 ../.venv/bin/python manage.py test household_validation
 ```
 
-Latest local result:
+Latest local result (before the program-based selection changes above):
 
 ```text
 Found 78 test(s).
 Ran 78 tests.
 OK
 ```
+
+**Caveat:** the program-based selection changes and the PWP config-shape change described above (`benefitPlanCode`, `program_eligibility_rules`, `select_households`'s `rule` argument, and the `tests.py` updates that go with it) were verified with `python3 -m compileall`/`flake8`/manual review only. This environment's venv has `household_validation` installed as a plain copy in site-packages rather than editable/linked to this source tree, so `manage.py test household_validation` here would run the *previous* code, not these changes — re-run the test suite from an environment where that package resolves to this checkout before relying on the "78 tests, OK" result for these changes specifically.
 
 The local openIMIS test runner logs database/configuration warnings while module configuration falls back to defaults, but the household validation test suite passes.
