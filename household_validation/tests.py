@@ -136,9 +136,10 @@ class HouseholdValidationConfigTest(TestCase):
         )
 
     def test_default_config_exposes_selection_percentages(self):
-        self.assertEqual(DEFAULT_CONFIG["female_headed_percentage"], 40)
-        self.assertEqual(DEFAULT_CONFIG["youth_percentage"], 40)
-        self.assertEqual(DEFAULT_CONFIG["reserve_percentage"], 20)
+        quota_config = DEFAULT_CONFIG["program_eligibility_rules"]["PWP"]["selection_strategy"]
+        self.assertEqual(quota_config["female_headed_percentage"], 40)
+        self.assertEqual(quota_config["youth_headed_percentage"], 40)
+        self.assertEqual(quota_config["reserve_percentage"], 20)
 
     def test_right_sets_match_default_config_scope(self):
         self.assertEqual(
@@ -395,12 +396,12 @@ class HouseholdSelectionTest(TestCase):
             for index in range(10)
         ]
 
-        with patch.object(HouseholdValidationConfig, "reserve_percentage", 20):
-            result, summary = select_households(
-                households,
-                target_count=10,
-                allocate_by_village=True,
-            )
+        result, summary = select_households(
+            households,
+            target_count=10,
+            allocate_by_village=True,
+            rule={"selection_strategy": {"reserve_percentage": 20}},
+        )
 
         self.assertEqual(
             {
@@ -437,7 +438,11 @@ class HouseholdSelectionTest(TestCase):
             _household("other", "Poorest"),
         ]
 
-        result, _ = select_households(households, target_count=3)
+        result, _ = select_households(
+            households,
+            target_count=3,
+            rule={"selection_strategy": {}},
+        )
 
         self.assertEqual([row.row_type for row in result.main], [ROW_TYPE_MAIN] * 3)
         self.assertEqual(
@@ -452,7 +457,11 @@ class HouseholdSelectionTest(TestCase):
             _household("youth", "Poorest", eligible_member_age=20),
         ]
 
-        result, _ = select_households(households, target_count=1)
+        result, _ = select_households(
+            households,
+            target_count=1,
+            rule={"selection_strategy": {}},
+        )
 
         self.assertEqual(result.main[0].household.id, "female-poorest")
 
@@ -462,7 +471,7 @@ class HouseholdSelectionTest(TestCase):
             _household("youth", "Poorer", eligible_member_age=20),
         ]
 
-        result, _ = select_households(households)
+        result, _ = select_households(households, rule={"selection_strategy": {}})
 
         self.assertEqual(len(result.main), 2)
         self.assertEqual(result.reserve, [])
@@ -474,8 +483,11 @@ class HouseholdSelectionTest(TestCase):
             _household("other", "Middle"),
         ]
 
-        with patch.object(HouseholdValidationConfig, "reserve_percentage", 50):
-            result, summary = select_households(households, target_count=2)
+        result, summary = select_households(
+            households,
+            target_count=2,
+            rule={"selection_strategy": {"reserve_percentage": 50}},
+        )
 
         self.assertEqual(len(result.main), 2)
         self.assertEqual(len(result.reserve), 1)
@@ -491,7 +503,11 @@ class HouseholdSelectionTest(TestCase):
             for index in range(1, 21)
         ]
 
-        result, _ = select_households(households, target_count=10)
+        result, _ = select_households(
+            households,
+            target_count=10,
+            rule={"selection_strategy": {}},
+        )
 
         self.assertEqual(len(result.main), 10)
         self.assertEqual(len(result.reserve), 2)
@@ -519,23 +535,24 @@ class HouseholdSelectionTest(TestCase):
             household.id: CATEGORY_OTHER for household in households
         }
 
-        with (
-            patch(
-                "household_validation.selection._select_main_households",
-                return_value=(
-                    selected_main,
-                    {household.id for household in households[:2]},
-                    category_counts,
-                    sum(
-                        len(household.eligible_members)
-                        for household in households[:2]
-                    ),
-                    household_categories,
+        with patch(
+            "household_validation.selection._select_main_households",
+            return_value=(
+                selected_main,
+                {household.id for household in households[:2]},
+                category_counts,
+                sum(
+                    len(household.eligible_members)
+                    for household in households[:2]
                 ),
+                household_categories,
             ),
-            patch.object(HouseholdValidationConfig, "reserve_percentage", 100),
         ):
-            result, summary = select_households(households, target_count=3)
+            result, summary = select_households(
+                households,
+                target_count=3,
+                rule={"selection_strategy": {"reserve_percentage": 100}},
+            )
 
         self.assertEqual(
             [row.household.id for row in result.reserve],
@@ -586,7 +603,11 @@ class HouseholdSelectionTest(TestCase):
             _household("other-2", "Middle"),
         ]
 
-        result, summary = select_households(households, target_count=3)
+        result, summary = select_households(
+            households,
+            target_count=3,
+            rule={"selection_strategy": {}},
+        )
 
         self.assertEqual(len(result.main), 3)
         self.assertEqual(
@@ -632,7 +653,11 @@ class HouseholdSelectionTest(TestCase):
             _household("age-36", "Poorest", eligible_member_age=36),
         ]
 
-        result, _ = select_households(households, target_count=3)
+        result, _ = select_households(
+            households,
+            target_count=3,
+            rule={"selection_strategy": {}},
+        )
 
         categories = {
             row.household.id: row.category
@@ -655,11 +680,11 @@ class HouseholdSelectionTest(TestCase):
             _household("other", "Poorest"),
         ]
 
-        with (
-            patch.object(HouseholdValidationConfig, "female_headed_percentage", 0),
-            patch.object(HouseholdValidationConfig, "youth_percentage", 100),
-        ):
-            result, _ = select_households(households, target_count=2)
+        result, _ = select_households(
+            households,
+            target_count=2,
+            rule={"selection_strategy": {"female_headed_percentage": 0, "youth_headed_percentage": 100}},
+        )
 
         self.assertEqual(
             [row.category for row in result.main],
@@ -673,11 +698,11 @@ class HouseholdSelectionTest(TestCase):
             + [_household(f"other-{i}", "Poorest") for i in range(5)]
         )
 
-        with (
-            patch.object(HouseholdValidationConfig, "female_headed_percentage", 30),
-            patch.object(HouseholdValidationConfig, "youth_percentage", 30),
-        ):
-            result, summary = select_households(households, target_count=10)
+        result, summary = select_households(
+            households,
+            target_count=10,
+            rule={"selection_strategy": {"female_headed_percentage": 30, "youth_headed_percentage": 30}},
+        )
 
         self.assertEqual(len(result.main), 10)
         self.assertEqual(summary["selected_female_headed_households"], 3)
@@ -690,11 +715,11 @@ class HouseholdSelectionTest(TestCase):
             + [_household(f"youth-{i}", "Poorest", eligible_member_age=25) for i in range(10)]
         )
 
-        with (
-            patch.object(HouseholdValidationConfig, "female_headed_percentage", 70),
-            patch.object(HouseholdValidationConfig, "youth_percentage", 60),
-        ):
-            result, summary = select_households(households, target_count=10)
+        result, summary = select_households(
+            households,
+            target_count=10,
+            rule={"selection_strategy": {"female_headed_percentage": 70, "youth_headed_percentage": 60}},
+        )
 
         self.assertEqual(len(result.main), 10)
         self.assertEqual(summary["selected_other_households"], 0)
