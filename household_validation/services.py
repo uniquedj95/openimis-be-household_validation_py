@@ -14,6 +14,7 @@ from individual.services import GroupIndividualService, IndividualService
 from location.models import Hotspot, MicroCatchment
 from project_social_protection.models import Project
 
+from household_validation.apps import HouseholdValidationConfig
 from household_validation.excel import (
     HAS_BUSINESS_COLUMN,
     LOCATION_COLUMN_TYPES,
@@ -903,6 +904,15 @@ class EligibleHouseholdSelectionService:
     def __init__(self, user=None):
         self.user = user
         self._project_name_cache = {}
+        self._eligibility_rule = None
+
+    @property
+    def eligibility_rule(self):
+        """The rule resolved by the most recent select/candidates/generate
+        call (``program_eligibility_rules["PWP"]`` unless a matching
+        ``benefit_plan_code`` was given). ``None`` before any of those have
+        run."""
+        return self._eligibility_rule
 
     def select(
         self,
@@ -923,6 +933,7 @@ class EligibleHouseholdSelectionService:
         catchment_code=None,
         exclude_verified_after=None,
         target_count=None,
+        benefit_plan_code=None,
     ):
         candidates = self.candidates(
             region_id=region_id,
@@ -940,6 +951,7 @@ class EligibleHouseholdSelectionService:
             hotspot_code=hotspot_code,
             catchment_id=catchment_id,
             catchment_code=catchment_code,
+            benefit_plan_code=benefit_plan_code,
         )
         selection_result, _ = select_households(
             candidates,
@@ -951,6 +963,7 @@ class EligibleHouseholdSelectionService:
                 or hotspot_id
                 or hotspot_code
             ),
+            rule=self._eligibility_rule,
         )
         return selection_result
 
@@ -971,7 +984,9 @@ class EligibleHouseholdSelectionService:
         hotspot_code=None,
         catchment_id=None,
         catchment_code=None,
+        benefit_plan_code=None,
     ):
+        self._eligibility_rule = self._resolve_eligibility_rule(benefit_plan_code)
         queryset = self._base_queryset()
         queryset = self._apply_location_filters(
             queryset,
@@ -1003,6 +1018,7 @@ class EligibleHouseholdSelectionService:
         ``SelectionResult`` to export the workbook, and the summary counts inline
         on the same response, so callers get a single request/response.
         """
+        self._eligibility_rule = self._resolve_eligibility_rule(filters.get("benefit_plan_code"))
         base_queryset = self._base_queryset()
         catchment_id = filters.get("catchment_id")
         catchment_code = filters.get("catchment_code")
@@ -1080,6 +1096,7 @@ class EligibleHouseholdSelectionService:
                 or filters.get("hotspot_id")
                 or filters.get("hotspot_code")
             ),
+            rule=self._eligibility_rule,
         )
         summary = {
             "total_households": total_households,
@@ -1298,6 +1315,22 @@ class EligibleHouseholdSelectionService:
             return None
         return MicroCatchment.objects.filter(identity_filter, validity_to__isnull=True).first()
 
+    def _resolve_eligibility_rule(self, benefit_plan_code):
+        """Eligibility + selection-strategy rule for the given Program
+        (benefit plan code).
+
+        Falls back to the ``"PWP"`` entry of ``program_eligibility_rules``
+        when ``benefit_plan_code`` is falsy or matches no configured rule,
+        so this always returns a rule — never ``None``.
+        """
+        rules = getattr(HouseholdValidationConfig, "program_eligibility_rules", None) or {}
+        rules = {str(code).upper(): rule for code, rule in rules.items()}
+        if benefit_plan_code:
+            matched = rules.get(str(benefit_plan_code).upper())
+            if matched:
+                return matched
+        return rules.get("PWP") or {}
+
     def _build_household(self, group):
         groupindividuals = [
             group_individual
@@ -1307,20 +1340,26 @@ class EligibleHouseholdSelectionService:
         eligible_members = []
         for group_individual in groupindividuals:
             member = self._build_member(group_individual)
-            if member and member.fit_for_work:
+            if member and member.is_eligible(self._eligibility_rule):
                 eligible_members.append(member)
         if not eligible_members:
             return None
 
         head = self._find_head(group, groupindividuals)
-        wealth_quintile = get_household_wealth_quintile(
-            group,
-            group_individuals=groupindividuals,
-        )
-        pmt_score = get_household_pmt_score(
-            group,
-            group_individuals=groupindividuals,
-        )
+        # Wealth ranking / PMT scoring only feed PWP's demographic-quota
+        # selection (selection_strategy present) — skip the work otherwise.
+        if (self._eligibility_rule or {}).get("selection_strategy") is not None:
+            wealth_quintile = get_household_wealth_quintile(
+                group,
+                group_individuals=groupindividuals,
+            )
+            pmt_score = get_household_pmt_score(
+                group,
+                group_individuals=groupindividuals,
+            )
+        else:
+            wealth_quintile = None
+            pmt_score = None
 
         group_json_ext = group.json_ext or {}
         location = getattr(group, "location", None)
@@ -1371,6 +1410,8 @@ class EligibleHouseholdSelectionService:
             fit_for_work=self._is_fit_for_work(group_individual),
             role=group_individual.role,
             recipient_type=group_individual.recipient_type,
+            data_source=json_ext.get("data_source"),
+            json_ext=json_ext,
             source=group_individual,
         )
 
