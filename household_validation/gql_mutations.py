@@ -11,7 +11,7 @@ from household_validation.models import HouseholdValidationBatch
 from household_validation.selection import (
     female_headed_percentage,
     reserve_percentage,
-    youth_percentage,
+    youth_headed_percentage,
 )
 from household_validation.services import (
     EligibleHouseholdSelectionService,
@@ -88,6 +88,7 @@ class GenerateHouseholdValidationListMutation(graphene.Mutation):
         catchment_code = graphene.String(required=False)
         exclude_verified_after = graphene.Date(required=False)
         target_count = graphene.Int(required=False)
+        benefit_plan_code = graphene.String(required=False)
 
     @classmethod
     def mutate(cls, root, info, **data):
@@ -95,7 +96,8 @@ class GenerateHouseholdValidationListMutation(graphene.Mutation):
             info.context.user,
             HouseholdValidationConfig.gql_mutation_generate_household_validation_list_perms,
         )
-        selection_result, summary = EligibleHouseholdSelectionService(info.context.user).generate(
+        service = EligibleHouseholdSelectionService(info.context.user)
+        selection_result, summary = service.generate(
             region_id=data.get("region_id"),
             region_code=data.get("region_code"),
             district_id=data.get("district_id"),
@@ -113,6 +115,7 @@ class GenerateHouseholdValidationListMutation(graphene.Mutation):
             catchment_code=data.get("catchment_code"),
             exclude_verified_after=data.get("exclude_verified_after"),
             target_count=data.get("target_count"),
+            benefit_plan_code=data.get("benefit_plan_code"),
         )
         projects = HouseholdValidationProjectLookupService().list_projects(
             location_id=(
@@ -134,6 +137,21 @@ class GenerateHouseholdValidationListMutation(graphene.Mutation):
             hotspot_code=data.get("hotspot_code"),
             catchment_id=data.get("catchment_id"),
         )
+        resolved_rule = service.eligibility_rule or {}
+        quota_config = resolved_rule.get("selection_strategy")
+        quota_percentages = (
+            {
+                "female_headed_percentage": female_headed_percentage(quota_config),
+                "youth_headed_percentage": youth_headed_percentage(quota_config),
+                "reserve_percentage": reserve_percentage(quota_config),
+            }
+            if quota_config is not None
+            else {
+                "female_headed_percentage": None,
+                "youth_headed_percentage": None,
+                "reserve_percentage": None,
+            }
+        )
         batch = HouseholdValidationBatch(
             district_id=data.get("district_id"),
             ta_id=data.get("ta_id"),
@@ -151,9 +169,8 @@ class GenerateHouseholdValidationListMutation(graphene.Mutation):
                 "region_code": data.get("region_code"),
                 "ta_codes": data.get("ta_codes") or [],
                 "gvh_codes": data.get("gvh_codes") or [],
-                "female_headed_percentage": female_headed_percentage(),
-                "youth_percentage": youth_percentage(),
-                "reserve_percentage": reserve_percentage(),
+                "benefit_plan_code": data.get("benefit_plan_code"),
+                **quota_percentages,
                 "member_rows": len(selection_result.member_rows),
                 **_json_safe(summary),
             },

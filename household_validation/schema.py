@@ -50,6 +50,7 @@ VALIDATION_FILTER_ARG_NAMES = {
     "catchment_code",
     "exclude_verified_after",
     "target_count",
+    "benefit_plan_code",
 }
 
 
@@ -72,6 +73,7 @@ def validation_filter_args():
         "catchment_code": graphene.Argument(graphene.String, required=False),
         "exclude_verified_after": graphene.Argument(graphene.Date, required=False),
         "target_count": graphene.Argument(graphene.Int, required=False),
+        "benefit_plan_code": graphene.Argument(graphene.String, required=False),
     }
 
 
