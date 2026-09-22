@@ -15,6 +15,7 @@ WEALTH_RANK = {
 
 CATEGORY_FEMALE_HEADED = "FEMALE_HEADED"
 CATEGORY_YOUTH = "YOUTH"
+# Every eligible household that is neither female-headed nor youth-headed
 CATEGORY_OTHER = "OTHER"
 
 ROW_TYPE_MAIN = "MAIN"
@@ -29,6 +30,8 @@ class EligibleMember:
     fit_for_work: bool = False
     role: str | None = None
     recipient_type: str | None = None
+    data_source: str | None = None
+    json_ext: dict = field(default_factory=dict)
     source: Any = None
 
     @property
@@ -39,6 +42,42 @@ class EligibleMember:
         return today.year - self.dob.year - (
             (today.month, today.day) < (self.dob.month, self.dob.day)
         )
+
+    def is_eligible(self, rule) -> bool:
+        """Whether this member counts towards a household's eligible members.
+
+        With no program-specific ``rule``, a member is eligible iff they're fit for work.
+        A rule can instead require a specific ``data_source``, ``recipient_type``, a truthy
+        ``json_ext`` flag, and/or an inclusive age range.
+        """
+        if not rule:
+            return self.fit_for_work
+
+        required_data_source = rule.get("requires_data_source")
+        if required_data_source:
+            if self.data_source is None:
+                return False
+            if str(self.data_source).strip().upper() != str(required_data_source).strip().upper():
+                return False
+
+        required_recipient_type = rule.get("requires_recipient_type")
+        if required_recipient_type:
+            if str(self.recipient_type or "").strip().upper() != str(required_recipient_type).strip().upper():
+                return False
+
+        flag = rule.get("member_flag")
+        if flag and not is_truthy(self.json_ext.get(flag)):
+            return False
+
+        min_age = rule.get("member_min_age")
+        if min_age is not None and (self.age is None or self.age < min_age):
+            return False
+
+        max_age = rule.get("member_max_age")
+        if max_age is not None and (self.age is None or self.age > max_age):
+            return False
+
+        return True
 
 
 @dataclass
@@ -161,10 +200,8 @@ def exclude_recently_verified(households, exclude_verified_after=None):
     ]
 
 
-def _configured_percentage(attr_name, default):
-    from household_validation.apps import HouseholdValidationConfig
-
-    value = getattr(HouseholdValidationConfig, attr_name, None)
+def _quota_percentage(quota_config, key, default):
+    value = (quota_config or {}).get(key)
     if value is None:
         return default
     try:
@@ -174,21 +211,21 @@ def _configured_percentage(attr_name, default):
     return max(0, min(value, 100))
 
 
-def female_headed_percentage():
-    return _configured_percentage("female_headed_percentage", 40)
+def female_headed_percentage(quota_config):
+    return _quota_percentage(quota_config, "female_headed_percentage", 40)
 
 
-def youth_percentage():
-    return _configured_percentage("youth_percentage", 40)
+def youth_headed_percentage(quota_config):
+    return _quota_percentage(quota_config, "youth_headed_percentage", 40)
 
 
-def reserve_percentage():
-    return _configured_percentage("reserve_percentage", 20)
+def reserve_percentage(quota_config):
+    return _quota_percentage(quota_config, "reserve_percentage", 20)
 
 
-def _allocate_quotas(target_count):
-    female_weight = female_headed_percentage() / 100
-    youth_weight = youth_percentage() / 100
+def _allocate_quotas(target_count, quota_config):
+    female_weight = female_headed_percentage(quota_config) / 100
+    youth_weight = youth_headed_percentage(quota_config) / 100
     if female_weight + youth_weight > 1:
         total = female_weight + youth_weight
         female_weight = female_weight / total
@@ -283,8 +320,8 @@ def _allocate_village_targets(households_by_village, target_count):
     return allocations, exact
 
 
-def _select_main_households(eligible, main_target):
-    quotas = _allocate_quotas(main_target)
+def _select_main_households(eligible, main_target, quota_config):
+    quotas = _allocate_quotas(main_target, quota_config)
     by_category = {
         CATEGORY_FEMALE_HEADED: [],
         CATEGORY_YOUTH: [],
@@ -336,24 +373,91 @@ def _select_main_households(eligible, main_target):
     )
 
 
+def _eligible_pool(households, exclude_verified_after):
+    """Households eligible for either selection algorithm: not recently
+    re-verified, and with at least one eligible member."""
+    return [
+        household
+        for household in exclude_recently_verified(households, exclude_verified_after)
+        if household.eligible_members
+    ]
+
+
+def _cap_target(target_count, pool_size):
+    """Clamp a requested ``target_count`` into ``[0, pool_size]``; ``None`` means "all"."""
+    target = pool_size if target_count is None else target_count
+    return max(0, min(target, pool_size))
+
+
+def _build_summary(main, reserve, selected_individuals, category_counts, village_breakdown):
+    return {
+        "selected_households": len(main),
+        "selected_individuals": selected_individuals,
+        "selected_female_headed_households": category_counts[CATEGORY_FEMALE_HEADED],
+        "selected_youth_households": category_counts[CATEGORY_YOUTH],
+        "selected_other_households": category_counts[CATEGORY_OTHER],
+        "reserve_households": len(reserve),
+        "village_breakdown": village_breakdown,
+    }
+
+
 def select_households(
     households,
     target_count=None,
     exclude_verified_after=None,
     allocate_by_village=False,
+    rule=None,
 ):
-    eligible = [
-        household
-        for household in exclude_recently_verified(households, exclude_verified_after)
-        if household.eligible_members
-    ]
-    eligible = sorted(eligible, key=household_sort_key)
+    """Single selection entry point for both the default PWP algorithm and
+    program-based (e.g. Jobs Now) instances.
 
-    main_target = len(eligible) if target_count is None else target_count
-    main_target = max(0, min(main_target, len(eligible)))
+    ``rule`` is resolved from ``program_eligibility_rules`` for the selected
+    Program (falling back to its ``"PWP"`` entry when no Program is selected
+    or none matches). Whether its ``selection_strategy`` key is present picks
+    the algorithm:
+
+    - Present, as a dict (PWP's default): wealth-ranked, female-headed/
+      youth/other demographic-quota allocation — percentages read from that
+      dict's ``female_headed_percentage``/``youth_headed_percentage``/
+      ``reserve_percentage`` — optionally allocated proportionally by
+      village, with a reserve list.
+    - Absent (e.g. Jobs Now's RMEP/UPG): no wealth ranking and no
+      demographic quotas — every eligible household is selected, ordered by
+      the rule's ``priority_flag`` (if any) and capped at ``target_count``
+      with no reserve list. ``allocate_by_village`` has no effect in this
+      mode: program-based generation has no hotspot/micro-catchment concept
+      to scope a village allocation by.
+    """
+    quota_config = (rule or {}).get("selection_strategy")
+
+    eligible = _eligible_pool(households, exclude_verified_after)
+    eligible = sorted(
+        eligible,
+        key=household_sort_key if quota_config is not None else _eligible_household_sort_key(rule),
+    )
+
+    main_target = _cap_target(target_count, len(eligible))
+
+    if quota_config is None:
+        selected = eligible[:main_target]
+        main = [
+            SelectedHousehold(household, CATEGORY_OTHER, ROW_TYPE_MAIN)
+            for household in selected
+        ]
+        reserve = []
+        selected_individuals = sum(len(household.eligible_members) for household in selected)
+        category_counts = {
+            CATEGORY_FEMALE_HEADED: 0,
+            CATEGORY_YOUTH: 0,
+            CATEGORY_OTHER: len(main),
+        }
+        village_breakdown = []
+        selection_result = SelectionResult(main=main, reserve=reserve)
+        summary = _build_summary(main, reserve, selected_individuals, category_counts, village_breakdown)
+        return selection_result, summary
 
     requested_reserve_target = math.ceil(
-        main_target * reserve_percentage() / 100
+        main_target * reserve_percentage(quota_config) / 100
     )
 
     village_breakdown = []
@@ -384,6 +488,7 @@ def select_households(
                 _select_main_households(
                     households_by_village[key],
                     main_allocations.get(key, 0),
+                    quota_config,
                 )
             )
             main.extend(village_main)
@@ -447,7 +552,7 @@ def select_households(
             category_counts,
             selected_individuals,
             household_categories,
-        ) = _select_main_households(eligible, main_target)
+        ) = _select_main_households(eligible, main_target, quota_config)
         reserve_target = max(
             0,
             min(
@@ -471,13 +576,29 @@ def select_households(
                 break
 
     selection_result = SelectionResult(main=main, reserve=reserve)
-    summary = {
-        "selected_households": len(main),
-        "selected_individuals": selected_individuals,
-        "selected_female_headed_households": category_counts[CATEGORY_FEMALE_HEADED],
-        "selected_youth_households": category_counts[CATEGORY_YOUTH],
-        "selected_other_households": category_counts[CATEGORY_OTHER],
-        "reserve_households": len(reserve),
-        "village_breakdown": village_breakdown,
-    }
+    summary = _build_summary(main, reserve, selected_individuals, category_counts, village_breakdown)
     return selection_result, summary
+
+
+def _household_has_priority_flag(household: EligibleHousehold, priority_flag):
+    if not priority_flag:
+        return False
+    return any(
+        is_truthy(member.json_ext.get(priority_flag))
+        for member in household.eligible_members
+    )
+
+
+def _eligible_household_sort_key(rule):
+    """Sort key factory for the ``rule``-driven branch of ``select_households``.
+
+    Households with an eligible member carrying the rule's ``priority_flag``
+    sort first; everything else keeps a stable, deterministic order behind them.
+    """
+    priority_flag = (rule or {}).get("priority_flag")
+
+    def key(household):
+        has_priority = _household_has_priority_flag(household, priority_flag)
+        return (not has_priority, str(household.code or ""), str(household.id))
+
+    return key
