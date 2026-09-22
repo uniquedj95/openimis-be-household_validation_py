@@ -78,11 +78,44 @@ DEFAULT_CONFIG = {
     ],
     "group_search_perms": [str(RIGHT_GROUP_SEARCH)],
     "group_update_perms": [str(RIGHT_GROUP_UPDATE)],
-    "female_headed_percentage": 40,
-    "youth_percentage": 40,
-    "reserve_percentage": 20,
     "business_columns_enabled": False,
     "business_type_options": DEFAULT_BUSINESS_TYPE_OPTIONS,
+    # Program Specific Eligibility + selection-strategy rules.
+    #
+    # - selection_strategy: presence/absence picks the algorithm. Omitted
+    #   (the default), all eligible households are selected, up to
+    #   target_count.
+    # - requires_data_source: a member must have this value in their
+    #   Individual.json_ext "data_source" key.
+    # - requires_recipient_type: a member's GroupIndividual.recipient_type
+    #   must match this value.
+    # - member_flag: a member must have this Individual.json_ext boolean
+    #   key to count towards the household's eligible members (a hard
+    #   requirement, unlike priority_flag below).
+    # - member_min_age / member_max_age: inclusive age bounds a member must
+    #   also fall within to be eligible.
+    # - priority_flag: a boolean key that ranks eligible households ahead
+    #   of the rest of the pool when capping at target_count.
+    "program_eligibility_rules": {
+        "PWP": {
+            "member_flag": "fit_for_work",
+            "selection_strategy": {
+                "female_headed_percentage": 40,
+                "youth_headed_percentage": 40,
+                "reserve_percentage": 20,
+            },
+        },
+        "RMEP": {
+            "requires_data_source": "PWP",
+            "priority_flag": "business_experience",
+        },
+        "UPG": {
+            "requires_data_source": "SCTP",
+            "member_flag": "fit_for_work",
+            "member_min_age": 18,
+            "member_max_age": 60,
+        },
+    },
 }
 
 
@@ -97,11 +130,9 @@ class HouseholdValidationConfig(AppConfig):
     gql_query_household_validation_error_report_perms = None
     group_search_perms = None
     group_update_perms = None
-    female_headed_percentage = None
-    youth_percentage = None
-    reserve_percentage = None
     business_columns_enabled = DEFAULT_CONFIG["business_columns_enabled"]
     business_type_options = None
+    program_eligibility_rules = None
 
     @classmethod
     def _load_config(cls, cfg):
