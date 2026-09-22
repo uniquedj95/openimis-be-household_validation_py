@@ -103,6 +103,7 @@ DEFAULT_CONFIG = {
                 "female_headed_percentage": 40,
                 "youth_headed_percentage": 40,
                 "reserve_percentage": 20,
+                "allocate_by_village": True,
             },
         },
         "RMEP": {

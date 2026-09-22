@@ -344,6 +344,7 @@ class HouseholdSelectionTest(TestCase):
             households,
             target_count=20,
             allocate_by_village=True,
+            rule={"selection_strategy": {}},
         )
 
         selected_by_village = {
@@ -378,11 +379,38 @@ class HouseholdSelectionTest(TestCase):
             households,
             target_count=3,
             allocate_by_village=True,
+            rule={"selection_strategy": {}},
         )
 
         self.assertEqual(
             {row.household.village_code for row in result.main},
             {"A", "B", "C"},
+        )
+
+    def test_allocate_by_village_config_can_disable_village_allocation(self):
+        households = (
+            [
+                _household(f"a-{index}", "Poorest", village_code="A")
+                for index in range(98)
+            ]
+            + [_household("b-1", "Poorest", village_code="B")]
+            + [_household("c-1", "Poorest", village_code="C")]
+        )
+
+        result, _ = select_households(
+            households,
+            target_count=3,
+            allocate_by_village=True,
+            rule={"selection_strategy": {"allocate_by_village": False}},
+        )
+
+        # With village allocation disabled via config, the request-level
+        # allocate_by_village=True is overridden: selection falls back to
+        # the flat, wealth-ranked quota algorithm, so village B/C no longer
+        # get a guaranteed slot.
+        self.assertEqual(
+            {row.household.village_code for row in result.main},
+            {"A"},
         )
 
     def test_village_reserve_is_proportional_and_excludes_main_households(self):

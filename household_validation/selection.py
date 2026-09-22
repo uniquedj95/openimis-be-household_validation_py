@@ -401,6 +401,125 @@ def _build_summary(main, reserve, selected_individuals, category_counts, village
     }
 
 
+def _select_simple(eligible, main_target):
+    """"
+    simple" strategy (no ``selection_strategy`` in the rule): just the
+    first ``main_target`` of the already priority-sorted eligible pool.
+    """
+    selected = eligible[:main_target]
+    main = [
+        SelectedHousehold(household, CATEGORY_OTHER, ROW_TYPE_MAIN)
+        for household in selected
+    ]
+    selected_individuals = sum(len(household.eligible_members) for household in selected)
+    category_counts = {
+        CATEGORY_FEMALE_HEADED: 0,
+        CATEGORY_YOUTH: 0,
+        CATEGORY_OTHER: len(main),
+    }
+    return main, [], selected_individuals, category_counts, []
+
+
+def _select_quota_flat(eligible, main_target, requested_reserve_target, quota_config):
+    """"quota" strategy, catchment-wide (no village allocation)."""
+    (
+        main,
+        selected_ids,
+        category_counts,
+        selected_individuals,
+        household_categories,
+    ) = _select_main_households(eligible, main_target, quota_config)
+
+    reserve_target = max(0, min(requested_reserve_target, len(eligible) - len(selected_ids)))
+    reserve = []
+    for household in eligible:
+        if household.id in selected_ids:
+            continue
+        selected_ids.add(household.id)
+        reserve.append(
+            SelectedHousehold(household, household_categories[household.id], ROW_TYPE_RESERVE)
+        )
+        if len(reserve) >= reserve_target:
+            break
+
+    return main, reserve, selected_individuals, category_counts, []
+
+
+def _select_quota_by_village(eligible, main_target, requested_reserve_target, quota_config):
+    """"quota" strategy, main list and reserve list each allocated
+    proportionally by village."""
+    households_by_village = {}
+    for household in eligible:
+        households_by_village.setdefault(_village_key(household), []).append(household)
+
+    main_allocations, exact_allocations = _allocate_village_targets(households_by_village, main_target)
+    main = []
+    selected_ids = set()
+    selected_individuals = 0
+    category_counts = {
+        CATEGORY_FEMALE_HEADED: 0,
+        CATEGORY_YOUTH: 0,
+        CATEGORY_OTHER: 0,
+    }
+    household_categories = {
+        household.id: categorize_household(household)
+        for household in eligible
+    }
+    village_selected_individuals = {}
+    for key in sorted(households_by_village, key=str):
+        village_main, village_ids, village_counts, village_individuals, _ = (
+            _select_main_households(
+                households_by_village[key],
+                main_allocations.get(key, 0),
+                quota_config,
+            )
+        )
+        main.extend(village_main)
+        selected_ids.update(village_ids)
+        selected_individuals += village_individuals
+        village_selected_individuals[key] = village_individuals
+        for category, count in village_counts.items():
+            category_counts[category] += count
+
+    reserve_target = max(0, min(requested_reserve_target, len(eligible) - len(selected_ids)))
+    remaining_by_village = {
+        key: [
+            household
+            for household in village_households
+            if household.id not in selected_ids
+        ]
+        for key, village_households in households_by_village.items()
+    }
+    reserve_allocations, _reserve_exact = _allocate_village_targets(remaining_by_village, reserve_target)
+    reserve = []
+    for key in sorted(remaining_by_village, key=str):
+        for household in remaining_by_village[key][:reserve_allocations.get(key, 0)]:
+            selected_ids.add(household.id)
+            reserve.append(
+                SelectedHousehold(household, household_categories[household.id], ROW_TYPE_RESERVE)
+            )
+
+    village_breakdown = []
+    for key in sorted(households_by_village, key=str):
+        representative = households_by_village[key][0]
+        allocation = main_allocations.get(key, 0)
+        village_breakdown.append(
+            {
+                "village_id": representative.village_id,
+                "village_code": representative.village_code,
+                "village_name": representative.village_name,
+                "eligible_households": len(households_by_village[key]),
+                "exact_allocation": round(exact_allocations.get(key, 0), 6),
+                "allocated_households": allocation,
+                "selected_households": allocation,
+                "selected_individuals": village_selected_individuals.get(key, 0),
+                "reserve_households": reserve_allocations.get(key, 0),
+            }
+        )
+
+    return main, reserve, selected_individuals, category_counts, village_breakdown
+
+
 def select_households(
     households,
     target_count=None,
@@ -408,25 +527,11 @@ def select_households(
     allocate_by_village=False,
     rule=None,
 ):
-    """Single selection entry point for both the default PWP algorithm and
-    program-based (e.g. Jobs Now) instances.
+    """
+    Select households based on the config provided criteria.
 
-    ``rule`` is resolved from ``program_eligibility_rules`` for the selected
-    Program (falling back to its ``"PWP"`` entry when no Program is selected
-    or none matches). Whether its ``selection_strategy`` key is present picks
-    the algorithm:
-
-    - Present, as a dict (PWP's default): wealth-ranked, female-headed/
-      youth/other demographic-quota allocation — percentages read from that
-      dict's ``female_headed_percentage``/``youth_headed_percentage``/
-      ``reserve_percentage`` — optionally allocated proportionally by
-      village, with a reserve list.
-    - Absent (e.g. Jobs Now's RMEP/UPG): no wealth ranking and no
-      demographic quotas — every eligible household is selected, ordered by
-      the rule's ``priority_flag`` (if any) and capped at ``target_count``
-      with no reserve list. ``allocate_by_village`` has no effect in this
-      mode: program-based generation has no hotspot/micro-catchment concept
-      to scope a village allocation by.
+    For the "quota" strategy, village-proportional allocation applies only when 
+    both `allocate_by_village` and the rule's own `selection_strategy["allocate_by_village"]` are true.
     """
     quota_config = (rule or {}).get("selection_strategy")
 
@@ -439,141 +544,20 @@ def select_households(
     main_target = _cap_target(target_count, len(eligible))
 
     if quota_config is None:
-        selected = eligible[:main_target]
-        main = [
-            SelectedHousehold(household, CATEGORY_OTHER, ROW_TYPE_MAIN)
-            for household in selected
-        ]
-        reserve = []
-        selected_individuals = sum(len(household.eligible_members) for household in selected)
-        category_counts = {
-            CATEGORY_FEMALE_HEADED: 0,
-            CATEGORY_YOUTH: 0,
-            CATEGORY_OTHER: len(main),
-        }
-        village_breakdown = []
-        selection_result = SelectionResult(main=main, reserve=reserve)
-        summary = _build_summary(main, reserve, selected_individuals, category_counts, village_breakdown)
-        return selection_result, summary
-
-    requested_reserve_target = math.ceil(
-        main_target * reserve_percentage(quota_config) / 100
-    )
-
-    village_breakdown = []
-    if allocate_by_village and target_count is not None:
-        households_by_village = {}
-        for household in eligible:
-            households_by_village.setdefault(_village_key(household), []).append(household)
-
-        main_allocations, exact_allocations = _allocate_village_targets(
-            households_by_village,
-            main_target,
+        main, reserve, selected_individuals, category_counts, village_breakdown = _select_simple(
+            eligible, main_target,
         )
-        main = []
-        selected_ids = set()
-        selected_individuals = 0
-        category_counts = {
-            CATEGORY_FEMALE_HEADED: 0,
-            CATEGORY_YOUTH: 0,
-            CATEGORY_OTHER: 0,
-        }
-        household_categories = {
-            household.id: categorize_household(household)
-            for household in eligible
-        }
-        village_selected_individuals = {}
-        for key in sorted(households_by_village, key=str):
-            village_main, village_ids, village_counts, village_individuals, _ = (
-                _select_main_households(
-                    households_by_village[key],
-                    main_allocations.get(key, 0),
-                    quota_config,
-                )
-            )
-            main.extend(village_main)
-            selected_ids.update(village_ids)
-            selected_individuals += village_individuals
-            village_selected_individuals[key] = village_individuals
-            for category, count in village_counts.items():
-                category_counts[category] += count
-
-        reserve_target = max(
-            0,
-            min(
-                requested_reserve_target,
-                len(eligible) - len(selected_ids),
-            ),
-        )
-        remaining_by_village = {
-            key: [
-                household
-                for household in households
-                if household.id not in selected_ids
-            ]
-            for key, households in households_by_village.items()
-        }
-        reserve_allocations, _reserve_exact = _allocate_village_targets(
-            remaining_by_village,
-            reserve_target,
-        )
-        reserve = []
-        for key in sorted(remaining_by_village, key=str):
-            for household in remaining_by_village[key][:reserve_allocations.get(key, 0)]:
-                selected_ids.add(household.id)
-                reserve.append(
-                    SelectedHousehold(
-                        household,
-                        household_categories[household.id],
-                        ROW_TYPE_RESERVE,
-                    )
-                )
-
-        for key in sorted(households_by_village, key=str):
-            representative = households_by_village[key][0]
-            allocation = main_allocations.get(key, 0)
-            village_breakdown.append(
-                {
-                    "village_id": representative.village_id,
-                    "village_code": representative.village_code,
-                    "village_name": representative.village_name,
-                    "eligible_households": len(households_by_village[key]),
-                    "exact_allocation": round(exact_allocations.get(key, 0), 6),
-                    "allocated_households": allocation,
-                    "selected_households": allocation,
-                    "selected_individuals": village_selected_individuals.get(key, 0),
-                    "reserve_households": reserve_allocations.get(key, 0),
-                }
-            )
     else:
-        (
-            main,
-            selected_ids,
-            category_counts,
-            selected_individuals,
-            household_categories,
-        ) = _select_main_households(eligible, main_target, quota_config)
-        reserve_target = max(
-            0,
-            min(
-                requested_reserve_target,
-                len(eligible) - len(selected_ids),
-            ),
-        )
-        reserve = []
-        for household in eligible:
-            if household.id in selected_ids:
-                continue
-            selected_ids.add(household.id)
-            reserve.append(
-                SelectedHousehold(
-                    household,
-                    household_categories[household.id],
-                    ROW_TYPE_RESERVE,
-                )
+        requested_reserve_target = math.ceil(main_target * reserve_percentage(quota_config) / 100)
+        village_allocation_enabled = quota_config.get("allocate_by_village", True)
+        if allocate_by_village and village_allocation_enabled and target_count is not None:
+            main, reserve, selected_individuals, category_counts, village_breakdown = _select_quota_by_village(
+                eligible, main_target, requested_reserve_target, quota_config,
             )
-            if len(reserve) >= reserve_target:
-                break
+        else:
+            main, reserve, selected_individuals, category_counts, village_breakdown = _select_quota_flat(
+                eligible, main_target, requested_reserve_target, quota_config,
+            )
 
     selection_result = SelectionResult(main=main, reserve=reserve)
     summary = _build_summary(main, reserve, selected_individuals, category_counts, village_breakdown)
