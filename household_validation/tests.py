@@ -85,6 +85,7 @@ from household_validation.upload import (
     PROJECT_SELECTION_TYPE_INTENT,
     VALIDATION_STATUS_NOT_VERIFIED,
     VALIDATION_LIST_SHEET,
+    UploadedValidationRow,
     build_validation_error_report_csv,
     build_validation_json_ext,
     member_structural_errors,
