@@ -14,7 +14,7 @@ from individual.services import GroupIndividualService, IndividualService
 from location.models import Hotspot, MicroCatchment
 from project_social_protection.models import Project
 
-from household_validation.apps import HouseholdValidationConfig
+from household_validation.apps import DEFAULT_CONFIG, HouseholdValidationConfig
 from household_validation.excel import (
     HAS_BUSINESS_COLUMN,
     LOCATION_COLUMN_TYPES,
@@ -1319,13 +1319,24 @@ class EligibleHouseholdSelectionService:
         """Eligibility + selection-strategy rule for the given Program
         (benefit plan code).
 
-        Falls back to the ``"PWP"`` entry of ``program_eligibility_rules`` only when ``benefit_plan_code`` is falsy (no Program selected).
-        A non-empty ``benefit_plan_code`` that matches no configured rule raises error
+        Falls back to the ``"PWP"`` entry of ``program_eligibility_rules``
+        only when ``benefit_plan_code`` is falsy (no Program selected). If a
+        deployment's ``ModuleConfiguration`` override of
+        ``program_eligibility_rules`` omits ``"PWP"`` entirely (that key
+        isn't deep-merged with the default — an override replaces the whole
+        dict), this falls back further to the built-in default PWP rule
+        rather than an empty ``{}``: an empty rule would silently make
+        ``select_households`` run the "simple" (program-based) algorithm
+        instead of PWP's wealth-ranked quota one, which is exactly the kind
+        of silent wrong-algorithm failure this method exists to avoid.
+
+        A non-empty ``benefit_plan_code`` that matches no configured rule
+        still raises, rather than falling back to PWP at all.
         """
         rules = getattr(HouseholdValidationConfig, "program_eligibility_rules", None) or {}
         rules = {str(code).upper(): rule for code, rule in rules.items()}
         if not benefit_plan_code:
-            return rules.get("PWP") or {}
+            return rules.get("PWP") or DEFAULT_CONFIG["program_eligibility_rules"]["PWP"]
         matched = rules.get(str(benefit_plan_code).upper())
         if matched is None:
             raise ValidationError(

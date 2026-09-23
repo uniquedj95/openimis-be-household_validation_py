@@ -865,12 +865,38 @@ class ResolveEligibilityRuleTest(TestCase):
             DEFAULT_CONFIG["program_eligibility_rules"]["UPG"],
         )
 
-    def test_missing_program_eligibility_rules_config_resolves_to_empty_rule(self):
+    def test_missing_program_eligibility_rules_config_still_falls_back_to_pwp(self):
+        # Even a completely missing (not just PWP-less) program_eligibility_rules
+        # config must not silently resolve to an empty {} rule -- that would make
+        # select_households run the "simple" algorithm instead of PWP's, for
+        # every request that never sends a benefitPlanCode.
         service = EligibleHouseholdSelectionService()
         with patch.object(HouseholdValidationConfig, "program_eligibility_rules", None):
-            self.assertEqual(service._resolve_eligibility_rule(None), {})
+            self.assertEqual(
+                service._resolve_eligibility_rule(None),
+                DEFAULT_CONFIG["program_eligibility_rules"]["PWP"],
+            )
             with self.assertRaises(ValidationError):
                 service._resolve_eligibility_rule("RMEP")
+
+    def test_pwp_less_override_still_falls_back_to_pwp(self):
+        # A deployment's ModuleConfiguration override of program_eligibility_rules
+        # replaces the whole dict (it isn't deep-merged with the default), so an
+        # override that only configures RMEP/UPG and forgets "PWP" must still
+        # resolve to a working PWP rule when benefitPlanCode is empty.
+        service = EligibleHouseholdSelectionService()
+        override = {"RMEP": DEFAULT_CONFIG["program_eligibility_rules"]["RMEP"]}
+        with patch.object(HouseholdValidationConfig, "program_eligibility_rules", override):
+            self.assertEqual(
+                service._resolve_eligibility_rule(None),
+                DEFAULT_CONFIG["program_eligibility_rules"]["PWP"],
+            )
+            self.assertEqual(
+                service._resolve_eligibility_rule("RMEP"),
+                override["RMEP"],
+            )
+            with self.assertRaises(ValidationError):
+                service._resolve_eligibility_rule("UPG")
 
 
 class HouseholdValidationPreviewServiceTest(TestCase):
