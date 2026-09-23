@@ -107,6 +107,25 @@ class HouseholdValidationConfigTest(TestCase):
             HouseholdValidationConfig._load_config({"business_columns_enabled": True})
             self.assertIs(HouseholdValidationConfig.business_columns_enabled, True)
 
+    def test_retired_quota_percentage_keys_warn_on_load(self):
+        # These flat keys stopped being read once the PWP quota percentages
+        # moved into program_eligibility_rules["PWP"]["selection_strategy"];
+        # a deployment whose saved ModuleConfiguration still sets them should
+        # be warned that the override is now silently ignored.
+        with self.assertLogs("household_validation.apps", level="WARNING") as logs:
+            HouseholdValidationConfig._load_config({
+                "female_headed_percentage": 55,
+                "reserve_percentage": 10,
+            })
+        [message] = logs.output
+        self.assertIn("female_headed_percentage", message)
+        self.assertIn("reserve_percentage", message)
+        self.assertNotIn("youth_headed_percentage", message)
+
+    def test_current_config_keys_do_not_warn_on_load(self):
+        with self.assertNoLogs("household_validation.apps", level="WARNING"):
+            HouseholdValidationConfig._load_config(DEFAULT_CONFIG)
+
     def test_default_config_exposes_permission_lists(self):
         self.assertEqual(
             DEFAULT_CONFIG["gql_query_household_validation_rule_perms"],

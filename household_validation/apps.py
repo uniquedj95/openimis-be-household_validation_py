@@ -1,6 +1,21 @@
+import logging
+
 from django.apps import AppConfig
 
+logger = logging.getLogger(__name__)
+
 MODULE_NAME = "household_validation"
+
+# Config keys that used to be flat HouseholdValidationConfig class attributes
+# before PWP's quota percentages moved into
+# program_eligibility_rules["PWP"]["selection_strategy"]. Kept only so
+# _load_config can warn a deployment whose saved ModuleConfiguration still
+# sets them that the override no longer does anything.
+RETIRED_CONFIG_KEYS = (
+    "female_headed_percentage",
+    "youth_percentage",
+    "reserve_percentage",
+)
 
 DEFAULT_BUSINESS_TYPE_OPTIONS = [
     "Crop farming",
@@ -142,6 +157,16 @@ class HouseholdValidationConfig(AppConfig):
         """
         # Existing deployments may have configuration saved before this flag.
         cls.business_columns_enabled = DEFAULT_CONFIG["business_columns_enabled"]
+        stale_keys = [key for key in RETIRED_CONFIG_KEYS if key in cfg]
+        if stale_keys:
+            logger.warning(
+                "household_validation ModuleConfiguration still sets %s, which no "
+                "longer has any effect on selection -- these moved into "
+                "program_eligibility_rules[\"PWP\"][\"selection_strategy\"]. Update "
+                "this deployment's ModuleConfiguration to migrate the override, or "
+                "it will silently use the default 40/40/20 quota split instead.",
+                ", ".join(stale_keys),
+            )
         for field in cfg:
             if hasattr(cls, field):
                 setattr(cls, field, cfg[field])
