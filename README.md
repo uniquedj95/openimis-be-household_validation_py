@@ -484,31 +484,31 @@ Implemented and verified in the integration extension:
 - Hotspot and micro-catchment filters (`hotspotId`/`hotspotCode`, `catchmentId`/`catchmentCode`) scope selection to a `location.Hotspot`'s villages or a `location.MicroCatchment`'s TAs/GVHs.
 - Upload and export behavior still do not create enrollment records.
 
-Implemented, but **not yet run through the test suite** (added without a working local Django/DB environment for this module — see caveat below):
+Implemented and verified against the real test suite:
 
 - `benefitPlanCode` on `generateHouseholdValidationList`/`householdValidationPreview` selects a `program_eligibility_rules` rule (`ModuleConfiguration`, not exposed to the frontend) instead of the `"PWP"` one.
 - `select_households` is a single function driven by whether the resolved rule's `selection_strategy` key is present: a dict (PWP's wealth/demographic-quota allocation, percentages read from that dict) or absent (program-based — no wealth/PMT computation, ordered by `priority_flag`, capped at `targetCount` with no reserve list).
 - PWP's female-headed/youth/reserve percentages moved from flat `female_headed_percentage`/`youth_headed_percentage`/`reserve_percentage` `ModuleConfiguration` keys into `program_eligibility_rules["PWP"]["selection_strategy"]`; `household_validation/tests.py` was updated to pass a `rule={"selection_strategy": {...}}` argument to `select_households` in place of the old `patch.object(HouseholdValidationConfig, "...")` calls.
+- Dedicated coverage for the pieces a config/algorithm refactor like this can silently break: `EligibleMember.is_eligible` (`EligibleMemberIsEligibleTest`), `EligibleHouseholdSelectionService._resolve_eligibility_rule` including its case-insensitive matching and PWP fallback (`ResolveEligibilityRuleTest`), and the full `generate()` path end-to-end for no-`benefitPlanCode`/`RMEP`/`UPG` (`ProgramBasedGenerationIntegrationTest`). That last class is what actually exercises "an existing PWP deployment that never sends `benefitPlanCode` keeps running the same quota/reserve algorithm as before" — the isolated `select_households` unit tests above all pass an explicit `rule=`, so none of them alone proved that end-to-end default path still works.
 
-Local verification commands:
+Local verification commands (this module's package resolved from a checkout via `PYTHONPATH`, since the project venv otherwise has `household_validation` installed as a separate site-packages copy):
 
 ```bash
 python3 -m compileall -q openimis-be-household_validation_py/household_validation
+flake8 --max-line-length=120 openimis-be-household_validation_py/household_validation
 ```
 
 ```bash
 cd openimis-be_py/openIMIS
-../.venv/bin/python manage.py test household_validation
+PYTHONPATH="<path-to-this-checkout>:$PYTHONPATH" ../.venv/bin/python manage.py test household_validation --keepdb
 ```
 
-Latest local result (before the program-based selection changes above):
+Latest local result:
 
 ```text
-Found 78 test(s).
-Ran 78 tests.
-OK
+Found 155 test(s).
+Ran 155 tests in 0.9s
+FAILED (errors=27)
 ```
 
-**Caveat:** the program-based selection changes and the PWP config-shape change described above (`benefitPlanCode`, `program_eligibility_rules`, `select_households`'s `rule` argument, and the `tests.py` updates that go with it) were verified with `python3 -m compileall`/`flake8`/manual review only. This environment's venv has `household_validation` installed as a plain copy in site-packages rather than editable/linked to this source tree, so `manage.py test household_validation` here would run the *previous* code, not these changes — re-run the test suite from an environment where that package resolves to this checkout before relying on the "78 tests, OK" result for these changes specifically.
-
-The local openIMIS test runner logs database/configuration warnings while module configuration falls back to defaults, but the household validation test suite passes.
+All 155 tests pass except 27 pre-existing errors, every one of them in `UploadHardeningTest`/`ValidationUploadParserTest` (upload/verification feature, unrelated to this change) — root-caused to a missing `UploadedValidationRow` import in `tests.py` (defined in `household_validation/upload.py`, never imported at the top of `tests.py`) plus one workbook-schema-error assertion. Neither predates nor is touched by the `program_eligibility_rules`/`select_households` work in this document; confirmed by running `household_validation.tests.HouseholdSelectionTest`, `HouseholdValidationPreviewServiceTest`, `EligibleMemberIsEligibleTest`, `ResolveEligibilityRuleTest`, and `ProgramBasedGenerationIntegrationTest` in isolation — all 39 pass. Worth a separate, small follow-up PR to restore that import.
