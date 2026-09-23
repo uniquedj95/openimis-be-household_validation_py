@@ -1347,8 +1347,12 @@ class EligibleHouseholdSelectionService:
 
         head = self._find_head(group, groupindividuals)
         # Wealth ranking / PMT scoring only feed PWP's demographic-quota
-        # selection (selection_strategy present) — skip the work otherwise.
-        if (self._eligibility_rule or {}).get("selection_strategy") is not None:
+        # selection. Skip the work only for a *resolved* rule with no
+        # selection_strategy (program-based/"simple"); self._eligibility_rule
+        # is None before select/candidates/generate resolves it (including
+        # direct _build_household() calls, e.g. in tests), which must behave
+        # like the original PWP default, not like "simple".
+        if self._eligibility_rule is None or self._eligibility_rule.get("selection_strategy") is not None:
             wealth_quintile = get_household_wealth_quintile(
                 group,
                 group_individuals=groupindividuals,

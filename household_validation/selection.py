@@ -530,7 +530,7 @@ def select_households(
     """
     Select households based on the config provided criteria.
 
-    For the "quota" strategy, village-proportional allocation applies only when 
+    For the "quota" strategy, village-proportional allocation applies only when
     both `allocate_by_village` and the rule's own `selection_strategy["allocate_by_village"]` are true.
     """
     quota_config = (rule or {}).get("selection_strategy")

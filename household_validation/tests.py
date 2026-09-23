@@ -275,13 +275,25 @@ def _dob_for_age(age):
     return date(today.year - age, today.month, today.day)
 
 
-def _member(member_id, gender="Male", age=40, fit_for_work=True, role=None):
+def _member(
+    member_id,
+    gender="Male",
+    age=40,
+    fit_for_work=True,
+    role=None,
+    recipient_type=None,
+    data_source=None,
+    json_ext=None,
+):
     return EligibleMember(
         id=member_id,
         gender=gender,
         dob=_dob_for_age(age),
         fit_for_work=fit_for_work,
         role=role,
+        recipient_type=recipient_type,
+        data_source=data_source,
+        json_ext=json_ext if json_ext is not None else {},
     )
 
 
@@ -757,6 +769,105 @@ class HouseholdSelectionTest(TestCase):
         )
 
 
+class EligibleMemberIsEligibleTest(TestCase):
+    def test_no_rule_falls_back_to_fit_for_work(self):
+        self.assertTrue(_member("m1", fit_for_work=True).is_eligible(None))
+        self.assertFalse(_member("m1", fit_for_work=False).is_eligible(None))
+        self.assertTrue(_member("m1", fit_for_work=True).is_eligible({}))
+
+    def test_requires_data_source_matches_case_insensitively(self):
+        member = _member("m1", data_source="pwp")
+        self.assertTrue(member.is_eligible({"requires_data_source": "PWP"}))
+        self.assertFalse(member.is_eligible({"requires_data_source": "SCTP"}))
+
+    def test_requires_data_source_fails_when_member_has_none(self):
+        member = _member("m1", data_source=None)
+        self.assertFalse(member.is_eligible({"requires_data_source": "PWP"}))
+
+    def test_requires_recipient_type_matches_case_insensitively(self):
+        member = _member("m1", recipient_type="primary")
+        self.assertTrue(member.is_eligible({"requires_recipient_type": "PRIMARY"}))
+        self.assertFalse(member.is_eligible({"requires_recipient_type": "SECONDARY"}))
+
+    def test_member_flag_requires_truthy_json_ext_value(self):
+        rule = {"member_flag": "business_experience"}
+        eligible = _member("m1", json_ext={"business_experience": True})
+        ineligible = _member("m2", json_ext={"business_experience": False})
+        missing = _member("m3", json_ext={})
+        self.assertTrue(eligible.is_eligible(rule))
+        self.assertFalse(ineligible.is_eligible(rule))
+        self.assertFalse(missing.is_eligible(rule))
+
+    def test_age_bounds_are_inclusive(self):
+        rule = {"member_min_age": 18, "member_max_age": 60}
+        self.assertTrue(_member("m1", age=18).is_eligible(rule))
+        self.assertTrue(_member("m2", age=60).is_eligible(rule))
+        self.assertFalse(_member("m3", age=17).is_eligible(rule))
+        self.assertFalse(_member("m4", age=61).is_eligible(rule))
+
+    def test_age_bounds_exclude_members_with_no_dob(self):
+        member = replace(_member("m1", age=30), dob=None)
+        self.assertFalse(member.is_eligible({"member_min_age": 18}))
+
+    def test_rmep_like_rule_requires_data_source_but_not_business_experience(self):
+        rule = {"requires_data_source": "PWP", "priority_flag": "business_experience"}
+        without_business = _member("m1", data_source="PWP", json_ext={"business_experience": False})
+        self.assertTrue(without_business.is_eligible(rule))
+        wrong_source = _member("m2", data_source="SCTP", json_ext={"business_experience": True})
+        self.assertFalse(wrong_source.is_eligible(rule))
+
+    def test_upg_like_rule_requires_data_source_fit_for_work_and_age_range(self):
+        rule = {
+            "requires_data_source": "SCTP",
+            "member_flag": "fit_for_work",
+            "member_min_age": 18,
+            "member_max_age": 60,
+        }
+        eligible = _member("m1", age=30, data_source="SCTP", json_ext={"fit_for_work": True})
+        self.assertTrue(eligible.is_eligible(rule))
+        too_young = _member("m2", age=17, data_source="SCTP", json_ext={"fit_for_work": True})
+        self.assertFalse(too_young.is_eligible(rule))
+        not_fit = _member("m3", age=30, data_source="SCTP", json_ext={"fit_for_work": False})
+        self.assertFalse(not_fit.is_eligible(rule))
+
+
+class ResolveEligibilityRuleTest(TestCase):
+    """Covers EligibleHouseholdSelectionService._resolve_eligibility_rule against
+    the module's real default program_eligibility_rules config, so it also acts
+    as a regression check on the shipped PWP/RMEP/UPG defaults themselves."""
+
+    def test_no_benefit_plan_code_resolves_to_pwp(self):
+        service = EligibleHouseholdSelectionService()
+        rule = service._resolve_eligibility_rule(None)
+        self.assertEqual(rule, DEFAULT_CONFIG["program_eligibility_rules"]["PWP"])
+        self.assertIn("selection_strategy", rule)
+
+    def test_unmatched_benefit_plan_code_falls_back_to_pwp(self):
+        service = EligibleHouseholdSelectionService()
+        rule = service._resolve_eligibility_rule("SOME_OTHER_PROGRAM")
+        self.assertEqual(rule, DEFAULT_CONFIG["program_eligibility_rules"]["PWP"])
+
+    def test_matched_benefit_plan_code_is_case_insensitive(self):
+        service = EligibleHouseholdSelectionService()
+        expected = DEFAULT_CONFIG["program_eligibility_rules"]["RMEP"]
+        self.assertEqual(service._resolve_eligibility_rule("RMEP"), expected)
+        self.assertEqual(service._resolve_eligibility_rule("rmep"), expected)
+        self.assertEqual(service._resolve_eligibility_rule("Rmep"), expected)
+
+    def test_upg_resolves_to_its_own_rule(self):
+        service = EligibleHouseholdSelectionService()
+        self.assertEqual(
+            service._resolve_eligibility_rule("UPG"),
+            DEFAULT_CONFIG["program_eligibility_rules"]["UPG"],
+        )
+
+    def test_missing_program_eligibility_rules_config_resolves_to_empty_rule(self):
+        service = EligibleHouseholdSelectionService()
+        with patch.object(HouseholdValidationConfig, "program_eligibility_rules", None):
+            self.assertEqual(service._resolve_eligibility_rule(None), {})
+            self.assertEqual(service._resolve_eligibility_rule("RMEP"), {})
+
+
 class HouseholdValidationPreviewServiceTest(TestCase):
     def test_generate_and_preview_share_selection_result(self):
         service = _FakeSelectionService(
@@ -843,6 +954,157 @@ class HouseholdValidationPreviewServiceTest(TestCase):
         self.assertEqual(row.village, "Village")
         self.assertEqual(row.wealth_quintile, "Poorest")
         self.assertEqual(row.validation_status, "VERIFIED")
+
+
+class ProgramBasedGenerationIntegrationTest(TestCase):
+    """End-to-end coverage through EligibleHouseholdSelectionService.generate,
+    exercising _resolve_eligibility_rule, EligibleMember.is_eligible, and
+    select_households together — including the no-benefitPlanCode path, which
+    is the actual backward-compatibility guarantee for existing PWP
+    deployments."""
+
+    def test_no_benefit_plan_code_runs_the_quota_algorithm(self):
+        groups = [
+            _fake_group("g-female", "HH-F", "Female", 30, "Poorest"),
+            _fake_group("g-youth", "HH-Y", "Male", 22, "Poorer"),
+            _fake_group("g-other", "HH-O", "Male", 45, "Middle"),
+            _fake_group(
+                "g-not-fit",
+                "HH-N",
+                "Male",
+                40,
+                "Poorest",
+                individual_json_ext={"fit_for_work": False},
+            ),
+        ]
+        service = _FakeSelectionService(groups)
+
+        selection_result, summary = service.generate(target_count=2)
+
+        # The not-fit-for-work household has no eligible members at all under
+        # the default (no benefitPlanCode) rule, so it's dropped entirely —
+        # this is the actual backward-compatibility guarantee: unchanged
+        # fit-for-work-only eligibility, running through the quota/reserve
+        # algorithm exactly as before this change.
+        self.assertEqual(summary["eligible_households"], 3)
+        self.assertNotIn(
+            "g-not-fit",
+            {row.household.id for row in selection_result.selected},
+        )
+        self.assertEqual(summary["selected_households"], 2)
+        self.assertEqual(summary["reserve_households"], 1)
+        self.assertEqual(
+            {row.household.id for row in selection_result.reserve},
+            {"g-other"},
+        )
+        # Demographic categorization only happens under the quota algorithm.
+        self.assertEqual(summary["selected_female_headed_households"], 1)
+        self.assertEqual(summary["selected_youth_households"], 1)
+
+    def test_benefit_plan_code_rmep_runs_the_simple_algorithm(self):
+        groups = [
+            _fake_group(
+                "g-business",
+                "HH-B",
+                "Male",
+                40,
+                "Poorest",
+                individual_json_ext={"data_source": "PWP", "business_experience": True},
+            ),
+            _fake_group(
+                "g-no-business",
+                "HH-NB",
+                "Male",
+                40,
+                "Poorest",
+                individual_json_ext={"data_source": "PWP", "business_experience": False},
+            ),
+            _fake_group(
+                "g-wrong-source",
+                "HH-WS",
+                "Male",
+                40,
+                "Poorest",
+                individual_json_ext={"data_source": "SCTP", "business_experience": True},
+            ),
+            _fake_group(
+                "g-not-fit-but-pwp",
+                "HH-NF",
+                "Male",
+                40,
+                "Poorest",
+                individual_json_ext={"data_source": "PWP", "fit_for_work": False},
+            ),
+        ]
+        service = _FakeSelectionService(groups)
+
+        selection_result, summary = service.generate(
+            target_count=10,
+            benefit_plan_code="RMEP",
+        )
+
+        selected_ids = [row.household.id for row in selection_result.main]
+        # Wrong data source is excluded entirely; RMEP doesn't require
+        # fit_for_work, so that PWP-sourced household still qualifies.
+        self.assertEqual(
+            set(selected_ids),
+            {"g-business", "g-no-business", "g-not-fit-but-pwp"},
+        )
+        # Business-experienced households are ranked first.
+        self.assertEqual(selected_ids[0], "g-business")
+        # No reserve list and no demographic categorization under this strategy.
+        self.assertEqual(selection_result.reserve, [])
+        self.assertEqual(summary["reserve_households"], 0)
+        self.assertEqual(summary["selected_female_headed_households"], 0)
+
+    def test_benefit_plan_code_upg_requires_source_fitness_and_age_range(self):
+        groups = [
+            _fake_group(
+                "g-eligible",
+                "HH-E",
+                "Male",
+                30,
+                "Poorest",
+                individual_json_ext={"data_source": "SCTP", "fit_for_work": True},
+            ),
+            _fake_group(
+                "g-too-old",
+                "HH-TO",
+                "Male",
+                65,
+                "Poorest",
+                individual_json_ext={"data_source": "SCTP", "fit_for_work": True},
+            ),
+            _fake_group(
+                "g-not-fit",
+                "HH-NF",
+                "Male",
+                30,
+                "Poorest",
+                individual_json_ext={"data_source": "SCTP", "fit_for_work": False},
+            ),
+            _fake_group(
+                "g-wrong-source",
+                "HH-WS",
+                "Male",
+                30,
+                "Poorest",
+                individual_json_ext={"data_source": "PWP", "fit_for_work": True},
+            ),
+        ]
+        service = _FakeSelectionService(groups)
+
+        selection_result, summary = service.generate(
+            target_count=10,
+            benefit_plan_code="UPG",
+        )
+
+        self.assertEqual(
+            {row.household.id for row in selection_result.main},
+            {"g-eligible"},
+        )
+        self.assertEqual(summary["eligible_households"], 1)
+        self.assertEqual(selection_result.reserve, [])
 
 
 class HotspotAndMicroCatchmentResolutionTest(TestCase):
@@ -1231,24 +1493,29 @@ def _fake_group(
     worker_age,
     wealth_quintile,
     validation_status=None,
+    individual_json_ext=None,
+    recipient_type="PRIMARY",
 ):
     location = _fake_location_tree()
+    individual_json = {
+        "gender": head_gender,
+        "fit_for_work": True,
+        "household_wealth_quintile": wealth_quintile,
+    }
+    if individual_json_ext:
+        individual_json.update(individual_json_ext)
     individual = SimpleNamespace(
         id=f"{group_id}-individual",
         first_name="Head",
         last_name="Person",
         dob=_dob_for_age(worker_age),
-        json_ext={
-            "gender": head_gender,
-            "fit_for_work": True,
-            "household_wealth_quintile": wealth_quintile,
-        },
+        json_ext=individual_json,
     )
     group_individual = SimpleNamespace(
         id=f"{group_id}-member",
         is_deleted=False,
         role="HEAD",
-        recipient_type="PRIMARY",
+        recipient_type=recipient_type,
         individual=individual,
         individual_id=individual.id,
     )
