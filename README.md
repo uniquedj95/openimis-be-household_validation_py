@@ -507,8 +507,8 @@ Latest local result:
 
 ```text
 Found 155 test(s).
-Ran 155 tests in 0.9s
-FAILED (errors=27)
+Ran 155 tests in 2.0s
+FAILED (errors=1)
 ```
 
-All 155 tests pass except 27 pre-existing errors, every one of them in `UploadHardeningTest`/`ValidationUploadParserTest` (upload/verification feature, unrelated to this change) — root-caused to a missing `UploadedValidationRow` import in `tests.py` (defined in `household_validation/upload.py`, never imported at the top of `tests.py`) plus one workbook-schema-error assertion. Neither predates nor is touched by the `program_eligibility_rules`/`select_households` work in this document; confirmed by running `household_validation.tests.HouseholdSelectionTest`, `HouseholdValidationPreviewServiceTest`, `EligibleMemberIsEligibleTest`, `ResolveEligibilityRuleTest`, and `ProgramBasedGenerationIntegrationTest` in isolation — all 39 pass. Worth a separate, small follow-up PR to restore that import.
+154 of 155 tests pass. The missing `UploadedValidationRow` import in `tests.py` (defined in `household_validation/upload.py`, used throughout `UploadHardeningTest` but never imported) has been fixed, which was the cause of 26 of the original 27 failures. The one remaining failure, `ValidationUploadParserTest.test_parse_validation_workbook_rejects_previous_schema`, is unrelated to any of this — a gap in `upload.py`'s workbook schema validation (it no longer reports "Missing required columns:" for a workbook missing them), not an import problem. Neither issue predates or is touched by the `program_eligibility_rules`/`select_households` work in this document.
