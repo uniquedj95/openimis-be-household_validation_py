@@ -8,6 +8,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
+from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.test import TestCase as DjangoTestCase
 from django.utils import timezone
@@ -843,10 +844,12 @@ class ResolveEligibilityRuleTest(TestCase):
         self.assertEqual(rule, DEFAULT_CONFIG["program_eligibility_rules"]["PWP"])
         self.assertIn("selection_strategy", rule)
 
-    def test_unmatched_benefit_plan_code_falls_back_to_pwp(self):
+    def test_unmatched_benefit_plan_code_raises(self):
+        # A non-empty code that matches nothing is a caller error and should raise,
+        # because it indicates a misconfiguration or a bug in the caller's code.
         service = EligibleHouseholdSelectionService()
-        rule = service._resolve_eligibility_rule("SOME_OTHER_PROGRAM")
-        self.assertEqual(rule, DEFAULT_CONFIG["program_eligibility_rules"]["PWP"])
+        with self.assertRaises(ValidationError):
+            service._resolve_eligibility_rule("SOME_OTHER_PROGRAM")
 
     def test_matched_benefit_plan_code_is_case_insensitive(self):
         service = EligibleHouseholdSelectionService()
@@ -866,7 +869,8 @@ class ResolveEligibilityRuleTest(TestCase):
         service = EligibleHouseholdSelectionService()
         with patch.object(HouseholdValidationConfig, "program_eligibility_rules", None):
             self.assertEqual(service._resolve_eligibility_rule(None), {})
-            self.assertEqual(service._resolve_eligibility_rule("RMEP"), {})
+            with self.assertRaises(ValidationError):
+                service._resolve_eligibility_rule("RMEP")
 
 
 class HouseholdValidationPreviewServiceTest(TestCase):

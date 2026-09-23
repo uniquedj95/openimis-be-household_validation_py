@@ -1319,17 +1319,19 @@ class EligibleHouseholdSelectionService:
         """Eligibility + selection-strategy rule for the given Program
         (benefit plan code).
 
-        Falls back to the ``"PWP"`` entry of ``program_eligibility_rules``
-        when ``benefit_plan_code`` is falsy or matches no configured rule,
-        so this always returns a rule — never ``None``.
+        Falls back to the ``"PWP"`` entry of ``program_eligibility_rules`` only when ``benefit_plan_code`` is falsy (no Program selected).
+        A non-empty ``benefit_plan_code`` that matches no configured rule raises error
         """
         rules = getattr(HouseholdValidationConfig, "program_eligibility_rules", None) or {}
         rules = {str(code).upper(): rule for code, rule in rules.items()}
-        if benefit_plan_code:
-            matched = rules.get(str(benefit_plan_code).upper())
-            if matched:
-                return matched
-        return rules.get("PWP") or {}
+        if not benefit_plan_code:
+            return rules.get("PWP") or {}
+        matched = rules.get(str(benefit_plan_code).upper())
+        if matched is None:
+            raise ValidationError(
+                f"No eligibility rule configured for benefit plan code '{benefit_plan_code}'"
+            )
+        return matched
 
     def _build_household(self, group):
         groupindividuals = [

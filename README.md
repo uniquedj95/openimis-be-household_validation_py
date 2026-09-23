@@ -51,7 +51,7 @@ Enrollment remains a reference workflow only. This module does not call enrollme
 
 ## Selection Algorithm
 
-`household_validation/selection.py::select_households` is the single implementation behind `generateHouseholdValidationList`, `householdValidationPreview`, and the Excel export, so all three always describe the same selection. It takes a `rule`, resolved from the `program_eligibility_rules` module configuration (see "Permissions" below) for the selected Program — falling back to that config's `"PWP"` entry when no Program is selected or none matches. Whether the rule has a `selection_strategy` key picks the algorithm: present (a dict of quota settings, PWP's) or absent (program-based, e.g. Jobs Now — see "Program-Based Selection" below).
+`household_validation/selection.py::select_households` is the single implementation behind `generateHouseholdValidationList`, `householdValidationPreview`, and the Excel export, so all three always describe the same selection. It takes a `rule`, resolved from the `program_eligibility_rules` module configuration (see "Permissions" below) for the selected Program — falling back to that config's `"PWP"` entry only when `benefitPlanCode` isn't sent at all. A `benefitPlanCode` that doesn't match any configured entry raises a `ValidationError` rather than silently falling back to PWP, since running PWP's wealth-ranked quota targeting for an unrecognized Program would be a worse failure mode than an explicit error. Whether the rule has a `selection_strategy` key picks the algorithm: present (a dict of quota settings, PWP's) or absent (program-based, e.g. Jobs Now — see "Program-Based Selection" below).
 
 **With `selection_strategy` present**, the algorithm runs in this order:
 
@@ -74,7 +74,7 @@ None of the three percentages are GraphQL arguments on `generateHouseholdValidat
 - **Ordering** is by the rule's `priority_flag`, if any: households with a qualifying member carrying that `json_ext` flag sort first (e.g. RMEP's `business_experience`); everything else follows in a stable, deterministic order (currently by household code/id — a placeholder until a real business-relevance score is defined).
 - **The main list is simply the first `targetCount` households** from that ordering — **there is no reserve/waiting list** in this mode. Households beyond `targetCount` are not selected at all (unlike the quota algorithm's 20%-of-target reserve pool).
 
-Deployments that never send `benefitPlanCode` (or send one with no matching rule) always resolve to the `"PWP"` rule, which has `selection_strategy` set, so they always run the quota algorithm described above.
+Deployments that never send `benefitPlanCode` always resolve to the `"PWP"` rule, which has `selection_strategy` set, so they always run the quota algorithm described above. Sending a `benefitPlanCode` that matches no configured rule is an error (see below), not a fallback to PWP.
 
 ## Permissions
 
@@ -97,7 +97,7 @@ The module configuration exposes these GraphQL permission keys:
 
 It also exposes `program_eligibility_rules`, which drives every selection algorithm described in "Selection Algorithm" above (none of these values are GraphQL arguments on `generateHouseholdValidationList`; update `ModuleConfiguration` for the `household_validation` module to change them):
 
-- `program_eligibility_rules`: a dict keyed by benefit plan code (matched case-insensitively against the `benefitPlanCode` GraphQL argument), including a `"PWP"` entry used whenever `benefitPlanCode` is absent or matches nothing. Each value is a rule with these optional keys:
+- `program_eligibility_rules`: a dict keyed by benefit plan code (matched case-insensitively against the `benefitPlanCode` GraphQL argument), including a `"PWP"` entry used whenever `benefitPlanCode` is absent. A non-empty `benefitPlanCode` that matches no key here raises a `ValidationError` instead of falling back to `"PWP"`. Each value is a rule with these optional keys:
   - `selection_strategy`: **presence, not its value, is what matters.** Given as a dict, PWP's wealth-ranked, demographic-quota algorithm runs, configured by that dict's own keys (below). Omitted entirely, the simple algorithm runs instead — see "Program-Based Selection" above.
     - `female_headed_percentage` (default `40`) / `youth_headed_percentage` (default `40`) / `reserve_percentage` (default `20`): the demographic quota split and reserve-list size, applied to the main-list target. There is intentionally no `other_percentage` key — the "other" quota is always derived as `100% - female_headed_percentage - youth_headed_percentage`, so it stays correct however the two configured values are changed.
   - `requires_data_source`: a member's `Individual.json_ext["data_source"]` must equal this value (case-insensitive) — a hard requirement.
